@@ -82,12 +82,11 @@ void Gui::Init() {
     mImGuiIo->LogFilename = mImGuiLogPath.c_str();
 
     if (SupportsViewports() &&
-        Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger(CVAR_ENABLE_MULTI_VIEWPORTS, 1)) {
+        Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger(CVAR_ENABLE_MULTI_VIEWPORTS, 0)) {
         mImGuiIo->ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;
     }
 
-    if (Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger(CVAR_IMGUI_CONTROLLER_NAV, 0) &&
-        GetMenuOrMenubarVisible()) {
+    if (CanUseGamepadNavigation()) {
         mImGuiIo->ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
     } else {
         mImGuiIo->ConfigFlags &= ~ImGuiConfigFlags_NavEnableGamepad;
@@ -127,19 +126,14 @@ bool Gui::SupportsViewports() {
     return false;
 }
 
-bool Gui::GamepadNavigationEnabled() {
-    return mImGuiIo->ConfigFlags & ImGuiConfigFlags_NavEnableGamepad;
+bool Gui::CanUseGamepadNavigation() {
+    return !mGamepadNavigationBlocked &&
+           Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger(CVAR_IMGUI_CONTROLLER_NAV, 0) &&
+           GetMenuOrMenubarVisible();
 }
 
-void Gui::BlockGamepadNavigation() {
-    mImGuiIo->ConfigFlags &= ~ImGuiConfigFlags_NavEnableGamepad;
-}
-
-void Gui::UnblockGamepadNavigation() {
-    if (Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger(CVAR_IMGUI_CONTROLLER_NAV, 0) &&
-        GetMenuOrMenubarVisible()) {
-        mImGuiIo->ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
-    }
+void Gui::SetGamepadNavigationBlocked(bool blocked) {
+    mGamepadNavigationBlocked = blocked;
 }
 
 ImGuiID Gui::GetMainGameWindowID() {
@@ -217,8 +211,7 @@ void Gui::DrawMenu() {
             GetMenuBar()->ToggleVisibility();
         }
         Ship::Context::GetInstance()->GetWindow()->GetMouseStateManager()->UpdateMouseCapture();
-        if (Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger(CVAR_IMGUI_CONTROLLER_NAV, 0) &&
-            GetMenuOrMenubarVisible()) {
+        if (CanUseGamepadNavigation()) {
             mImGuiIo->ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
         } else {
             mImGuiIo->ConfigFlags &= ~ImGuiConfigFlags_NavEnableGamepad;

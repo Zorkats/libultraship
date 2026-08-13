@@ -55,7 +55,7 @@ void InputEditorWindow::UpdateElement() {
             }
         }
 
-        Ship::Context::GetInstance()->GetWindow()->GetGui()->BlockGamepadNavigation();
+        Ship::Context::GetInstance()->GetWindow()->GetGui()->SetGamepadNavigationBlocked(true);
     } else {
         if (mGameInputBlockTimer != INT32_MAX) {
             mGameInputBlockTimer--;
@@ -66,13 +66,13 @@ void InputEditorWindow::UpdateElement() {
             }
         }
 
-        if (Ship::Context::GetInstance()->GetWindow()->GetGui()->GamepadNavigationEnabled()) {
+        if (Ship::Context::GetInstance()->GetWindow()->GetGui()->CanUseGamepadNavigation()) {
             mMappingInputBlockTimer = ImGui::GetIO().Framerate / 3;
         } else {
             mMappingInputBlockTimer = INT32_MAX;
         }
 
-        Ship::Context::GetInstance()->GetWindow()->GetGui()->UnblockGamepadNavigation();
+        Ship::Context::GetInstance()->GetWindow()->GetGui()->SetGamepadNavigationBlocked(false);
     }
 }
 

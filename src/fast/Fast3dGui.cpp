@@ -380,6 +380,18 @@ void Fast3dGui::CalculateGameViewport() {
         }
     }
 
+    auto interpreter = mInterpreter.lock();
+    const uint32_t maxTextureSize = interpreter->GetCurrentRenderingAPI()->GetMaxTextureSize();
+    if (maxTextureSize > 0 &&
+        (interpreter->mCurDimensions.width > maxTextureSize || interpreter->mCurDimensions.height > maxTextureSize)) {
+        const uint32_t dominantDimension = interpreter->mCurDimensions.width > interpreter->mCurDimensions.height
+                                               ? interpreter->mCurDimensions.width
+                                               : interpreter->mCurDimensions.height;
+        const double scale = static_cast<double>(maxTextureSize) / dominantDimension;
+        interpreter->mCurDimensions.width = static_cast<uint32_t>(interpreter->mCurDimensions.width * scale);
+        interpreter->mCurDimensions.height = static_cast<uint32_t>(interpreter->mCurDimensions.height * scale);
+    }
+
     ImGui::End();
 }
 

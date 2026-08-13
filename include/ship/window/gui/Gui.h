@@ -144,14 +144,8 @@ class Gui {
     /** @brief Returns true if the mouse cursor is over an active ImGui popup. */
     bool IsMouseOverActivePopup();
 
-    /** @brief Returns true if ImGui gamepad navigation is enabled. */
-    bool GamepadNavigationEnabled();
-
-    /** @brief Disables ImGui gamepad navigation (allows the game to use gamepad input). */
-    void BlockGamepadNavigation();
-
-    /** @brief Re-enables ImGui gamepad navigation. */
-    void UnblockGamepadNavigation();
+    bool CanUseGamepadNavigation();
+    void SetGamepadNavigationBlocked(bool blocked);
 
     /** @brief Re-binds the ImGui platform backend's gamepad list to the currently
      *  connected controllers. Called once at init and on controller add/remove so it
@@ -228,6 +222,7 @@ class Gui {
     std::map<std::string, std::shared_ptr<GuiWindow>> mGuiWindows; ///< Registered window map (name → window).
 
   private:
+    bool mGamepadNavigationBlocked = false;
     bool mNeedsConsoleVariableSave;
     std::string mImGuiIniPath;
     std::string mImGuiLogPath;

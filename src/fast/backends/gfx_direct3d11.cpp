@@ -382,7 +382,7 @@ void CSMain(uint3 DTid : SV_DispatchThreadID) {
 }
 
 int GfxRenderingAPIDX11::GetMaxTextureSize() {
-    return D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION;
+    return mFeatureLevel <= D3D_FEATURE_LEVEL_10_1 ? 8192 : D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION;
 }
 
 const char* GfxRenderingAPIDX11::GetName() {
@@ -997,6 +997,10 @@ void GfxRenderingAPIDX11::UpdateFramebufferParameters(int fb_id, uint32_t width,
     }
 
     bool diff = tex.width != width || tex.height != height || fb.msaa_level != msaa_level;
+    const bool update_depth_buffer =
+        has_depth_buffer &&
+        (diff || !fb.has_depth_buffer || (fb.depth_stencil_srv.Get() != nullptr) != can_extract_depth);
+    bool depth_updated = false;
 
     if (diff || (fb.render_target_view.Get() != nullptr) != render_target) {
         if (fb_id != 0) {
@@ -1014,11 +1018,34 @@ void GfxRenderingAPIDX11::UpdateFramebufferParameters(int fb_id, uint32_t width,
             texture_desc.SampleDesc.Count = msaa_level;
             texture_desc.SampleDesc.Quality = 0;
 
-            ThrowIfFailed(mDevice->CreateTexture2D(&texture_desc, nullptr, tex.texture.ReleaseAndGetAddressOf()));
+            ComPtr<ID3D11Texture2D> new_texture;
+            ComPtr<ID3D11ShaderResourceView> new_resource_view;
+            ComPtr<ID3D11RenderTargetView> new_render_target_view;
+            ThrowIfFailed(mDevice->CreateTexture2D(&texture_desc, nullptr, new_texture.GetAddressOf()));
 
             if (msaa_level <= 1) {
-                ThrowIfFailed(mDevice->CreateShaderResourceView(tex.texture.Get(), nullptr,
-                                                                tex.resource_view.ReleaseAndGetAddressOf()));
+                ThrowIfFailed(mDevice->CreateShaderResourceView(new_texture.Get(), nullptr,
+                                                                new_resource_view.GetAddressOf()));
+            }
+            if (render_target) {
+                ThrowIfFailed(
+                    mDevice->CreateRenderTargetView(new_texture.Get(), nullptr, new_render_target_view.GetAddressOf()));
+            }
+
+            ComPtr<ID3D11DepthStencilView> new_depth_stencil_view;
+            ComPtr<ID3D11ShaderResourceView> new_depth_stencil_srv;
+            if (update_depth_buffer) {
+                CreateDepthStencilObjects(width, height, msaa_level, new_depth_stencil_view.GetAddressOf(),
+                                          can_extract_depth ? new_depth_stencil_srv.GetAddressOf() : nullptr);
+            }
+
+            tex.texture = new_texture;
+            tex.resource_view = new_resource_view;
+            fb.render_target_view = new_render_target_view;
+            if (update_depth_buffer) {
+                fb.depth_stencil_view = new_depth_stencil_view;
+                fb.depth_stencil_srv = new_depth_stencil_srv;
+                depth_updated = true;
             }
         } else if (diff || (render_target && tex.texture.Get() == nullptr)) {
             DXGI_SWAP_CHAIN_DESC1 desc1;
@@ -1031,21 +1058,25 @@ void GfxRenderingAPIDX11::UpdateFramebufferParameters(int fb_id, uint32_t width,
             }
             ThrowIfFailed(
                 swap_chain->GetBuffer(0, __uuidof(ID3D11Texture2D), (LPVOID*)tex.texture.ReleaseAndGetAddressOf()));
-        }
-        if (render_target) {
-            ThrowIfFailed(mDevice->CreateRenderTargetView(tex.texture.Get(), nullptr,
-                                                          fb.render_target_view.ReleaseAndGetAddressOf()));
+            if (render_target) {
+                ComPtr<ID3D11RenderTargetView> new_render_target_view;
+                ThrowIfFailed(
+                    mDevice->CreateRenderTargetView(tex.texture.Get(), nullptr, new_render_target_view.GetAddressOf()));
+                fb.render_target_view = new_render_target_view;
+            }
         }
 
         tex.width = width;
         tex.height = height;
     }
 
-    if (has_depth_buffer &&
-        (diff || !fb.has_depth_buffer || (fb.depth_stencil_srv.Get() != nullptr) != can_extract_depth)) {
-        fb.depth_stencil_srv.Reset();
-        CreateDepthStencilObjects(width, height, msaa_level, fb.depth_stencil_view.ReleaseAndGetAddressOf(),
-                                  can_extract_depth ? fb.depth_stencil_srv.GetAddressOf() : nullptr);
+    if (update_depth_buffer && !depth_updated) {
+        ComPtr<ID3D11DepthStencilView> new_depth_stencil_view;
+        ComPtr<ID3D11ShaderResourceView> new_depth_stencil_srv;
+        CreateDepthStencilObjects(width, height, msaa_level, new_depth_stencil_view.GetAddressOf(),
+                                  can_extract_depth ? new_depth_stencil_srv.GetAddressOf() : nullptr);
+        fb.depth_stencil_view = new_depth_stencil_view;
+        fb.depth_stencil_srv = new_depth_stencil_srv;
     }
     if (!has_depth_buffer) {
         fb.depth_stencil_view.Reset();
