@@ -627,6 +627,11 @@ void Fast3dGui::LoadTextureFromRawImage(const std::string& name, const std::stri
 }
 
 void Fast3dGui::LoadTextureFromResource(const std::string& name, std::shared_ptr<Ship::GuiTexture> texture) {
+    if (texture == nullptr) {
+        SPDLOG_ERROR("Failed to load GUI texture resource '{}'", name);
+        return;
+    }
+
     GfxRenderingAPI* api = mInterpreter.lock()->GetCurrentRenderingAPI();
 
     // TODO: Nothing ever unloads the texture from Fast3D here.

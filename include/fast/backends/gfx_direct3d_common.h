@@ -141,6 +141,7 @@ class GfxRenderingAPIDX11 final : public GfxRenderingAPI {
 
     HMODULE mCompilerModule;
     pD3DCompile mD3dCompile;
+    decltype(&D3DCreateBlob) mD3dCreateBlob = nullptr;
 
     uint32_t mMsaaNumQualityLevels[D3D11_MAX_MULTISAMPLE_SAMPLE_COUNT];
 

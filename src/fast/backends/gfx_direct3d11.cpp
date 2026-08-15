@@ -6,6 +6,7 @@
 
 #include <chrono>
 #include <map>
+#include <stdexcept>
 #include <unordered_map>
 
 #include <windows.h>
@@ -49,6 +50,24 @@
 using namespace Microsoft::WRL; // For ComPtr
 
 namespace Fast {
+
+static size_t GetVertexFloatCount(const CCFeatures& ccFeatures) {
+    size_t count = 4;
+    for (size_t texture = 0; texture < 2; ++texture) {
+        if (!ccFeatures.usedTextures[texture]) {
+            continue;
+        }
+
+        count += 2;
+        count += ccFeatures.clamp[texture][0] ? 1 : 0;
+        count += ccFeatures.clamp[texture][1] ? 1 : 0;
+    }
+
+    count += ccFeatures.opt_fog ? 4 : 0;
+    count += ccFeatures.opt_grayscale ? 4 : 0;
+    count += ccFeatures.numInputs * (ccFeatures.opt_alpha ? 4 : 3);
+    return count;
+}
 
 GfxRenderingAPIDX11::~GfxRenderingAPIDX11() {
 }
@@ -212,6 +231,11 @@ void GfxRenderingAPIDX11::Init() {
                       "D3DCompiler_47.dll not found");
     }
     mD3dCompile = (pD3DCompile)GetProcAddress(mCompilerModule, "D3DCompile");
+    mD3dCreateBlob = reinterpret_cast<decltype(mD3dCreateBlob)>(GetProcAddress(mCompilerModule, "D3DCreateBlob"));
+    if (mD3dCreateBlob == nullptr) {
+        ThrowIfFailed(HRESULT_FROM_WIN32(ERROR_PROC_NOT_FOUND), mWindowBackend->GetWindowHandle(),
+                      "D3DCreateBlob not found in D3DCompiler_47.dll");
+    }
 
     // Create D3D11 mDevice
 
@@ -414,15 +438,9 @@ struct ShaderProgram* GfxRenderingAPIDX11::CreateAndLoadNewShader(uint64_t shade
         (mCurrentFilterMode == FILTER_THREE_POINT ? (uint32_t)SHADER_CACHE_FLAG_THREE_POINT : 0u) |
         (mSrgbMode ? (uint32_t)SHADER_CACHE_FLAG_SRGB : 0u);
 
-    /*
-     * Cached payload layout, little-endian: numFloats u32, vsSize u32, psSize u32, then the two
-     * DXBC blobs back to back.
-     *
-     * numFloats has to ride along: it is an out-param of gfx_direct3d_common_build_shader, and a
-     * cache hit skips source generation, so there is nowhere else to recover it from. Everything
-     * else below derives from cc_features.
-     */
-    size_t numFloats = 0;
+    // Keep the stored float count for cache compatibility, but derive the runtime stride from the
+    // shader features so damaged metadata cannot reinterpret the vertex stream.
+    const size_t numFloats = GetVertexFloatCount(cc_features);
     const uint8_t* vsBytes = nullptr;
     const uint8_t* psBytes = nullptr;
     size_t vsSize = 0;
@@ -436,18 +454,41 @@ struct ShaderProgram* GfxRenderingAPIDX11::CreateAndLoadNewShader(uint64_t shade
         memcpy(&storedFloats, cached->data(), sizeof(storedFloats));
         memcpy(&storedVs, cached->data() + 4, sizeof(storedVs));
         memcpy(&storedPs, cached->data() + 8, sizeof(storedPs));
-        if ((size_t)storedVs + storedPs + kPayloadHeader == cached->size() && storedVs > 0 && storedPs > 0) {
-            numFloats = storedFloats;
-            vsBytes = cached->data() + kPayloadHeader;
-            vsSize = storedVs;
-            psBytes = vsBytes + storedVs;
-            psSize = storedPs;
+        if ((size_t)storedVs + storedPs + kPayloadHeader == cached->size() && storedVs >= 4 && storedPs >= 4 &&
+            memcmp(cached->data() + kPayloadHeader, "DXBC", 4) == 0 &&
+            memcmp(cached->data() + kPayloadHeader + storedVs, "DXBC", 4) == 0) {
+            const uint8_t* storedVsBytes = cached->data() + kPayloadHeader;
+            const uint8_t* storedPsBytes = storedVsBytes + storedVs;
+            if (storedFloats != numFloats) {
+                SPDLOG_WARN("[shader-cache] d3d11 ignored invalid vertex stride: stored={} expected={} id0={:016X} "
+                            "id1={:016X}",
+                            storedFloats, numFloats, shader_id0, shader_id1);
+            }
+
+            // Cache hits start at an offset inside the packed payload. Recreate the ID3DBlob
+            // representation returned by D3DCompile to avoid driver-dependent bytecode handling.
+            ThrowIfFailed(mD3dCreateBlob(storedVs, vs.GetAddressOf()), mWindowBackend->GetWindowHandle(),
+                          "Failed to allocate cached vertex shader blob");
+            ThrowIfFailed(mD3dCreateBlob(storedPs, ps.GetAddressOf()), mWindowBackend->GetWindowHandle(),
+                          "Failed to allocate cached pixel shader blob");
+            memcpy(vs->GetBufferPointer(), storedVsBytes, storedVs);
+            memcpy(ps->GetBufferPointer(), storedPsBytes, storedPs);
+            vsBytes = static_cast<const uint8_t*>(vs->GetBufferPointer());
+            vsSize = vs->GetBufferSize();
+            psBytes = static_cast<const uint8_t*>(ps->GetBufferPointer());
+            psSize = ps->GetBufferSize();
         }
     }
 
     if (vsBytes == nullptr) {
-        auto shader = gfx_direct3d_common_build_shader(numFloats, cc_features, false,
+        size_t generatedNumFloats = 0;
+        auto shader = gfx_direct3d_common_build_shader(generatedNumFloats, cc_features, false,
                                                        mCurrentFilterMode == FILTER_THREE_POINT, mSrgbMode);
+        if (generatedNumFloats != numFloats) {
+            SPDLOG_ERROR("D3D11 vertex layout mismatch: generated={} expected={} id0={:016X} id1={:016X}",
+                         generatedNumFloats, numFloats, shader_id0, shader_id1);
+            throw std::runtime_error("D3D11 vertex layout does not match the generated shader");
+        }
 
         char* buf = shader.data();
         size_t len = shader.size();
