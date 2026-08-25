@@ -32,6 +32,7 @@ class GfxWindowBackendDXGI final : public GfxWindowBackend {
     bool GetMouseState(uint32_t btn) override;
     void SetMouseCapture(bool capture) override;
     bool IsMouseCaptured() override;
+    void SetMouseGrab(bool grab) override;
     void GetDimensions(uint32_t* width, uint32_t* height, int32_t* posX, int32_t* posY) override;
     void SetDimensions(uint32_t width, uint32_t height, int32_t posX, int32_t posY) override;
     Ship::WindowRect GetPrimaryMonitorRect() override;
@@ -62,6 +63,7 @@ class GfxWindowBackendDXGI final : public GfxWindowBackend {
     void HandleRawInputBuffered();
     void UpdateMousePrevPos();
     void ApplyMouseCaptureClip();
+    void ApplyMouseGrabClip();
 
     std::tuple<HMONITOR, RECT, BOOL> mMonitor; // 0: Handle, 1: Display Monitor Rect, 2: Is_Primary
     uint32_t current_width, current_height;    // Width and height of client areas
@@ -73,6 +75,7 @@ class GfxWindowBackendDXGI final : public GfxWindowBackend {
     POINT mRawMouseDeltaBuf;
     float mMouseWheel[2];
     bool mIsMouseCaptured;
+    bool mIsMouseGrabbed;
     bool mIsMouseHovered;
     bool mInFocus;
     bool mHasMousePosition;

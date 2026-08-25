@@ -478,10 +478,26 @@ void Fast3dGui::DrawGame() {
     uintptr_t fb = Ship::Context::GetInstance()->GetWindow()->GetGfxFrameBuffer();
     if (fb) {
         ImGui::SetCursorPos(pos);
+        // GetCursorScreenPos (not mainPos + pos): the cursor already folds in the window's
+        // content-region offset, so this is the true client-space origin of the blit.
+        mGameBlitPos = ImGui::GetCursorScreenPos();
+        mGameBlitSize = size;
+        mGameBlitValid = true;
         ImGui::Image(reinterpret_cast<ImTextureID>(fb), size);
     }
 
     ImGui::End();
+}
+
+bool Fast3dGui::GetGameBlitRect(float* x, float* y, float* w, float* h) {
+    if (!mGameBlitValid) {
+        return false;
+    }
+    *x = mGameBlitPos.x;
+    *y = mGameBlitPos.y;
+    *w = mGameBlitSize.x;
+    *h = mGameBlitSize.y;
+    return true;
 }
 
 void Fast3dGui::ApplyResolutionChanges() {

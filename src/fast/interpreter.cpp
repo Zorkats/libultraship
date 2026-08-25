@@ -30,6 +30,7 @@
 #include "fast/lus_gbi.h"
 #include "fast/backends/gfx_window_manager_api.h"
 #include "fast/backends/gfx_rendering_api.h"
+#include "fast/backends/gfx_post_shader_pipeline.h"
 
 #include "ship/window/gui/Gui.h"
 #include "ship/resource/ResourceManager.h"
@@ -50,6 +51,8 @@ std::stack<std::string> currentDir;
 
 // Run-log shim from the port (port_log.h), used by the env-gated diagnostics below.
 extern "C" void gdx_dbg_logf(const char* fmt, ...);
+extern "C" void gdx_ck(const char* s);
+extern "C" void gdx_cki(const char* s, int v);
 
 #define SEG_ADDR(seg, addr) (addr | (seg << 24) | 1)
 #define SUPPORT_CHECK(x) assert(x)
@@ -552,6 +555,14 @@ extern "C" void gdx_workshop_dump_texture(const void* origSrcAddr, size_t origSr
                                           const char* resourcePathOrNull, const uint8_t* rgba32,
                                           int width, int height, int n64Fmt, int n64Siz);
 
+// Workshop texture packs (port/gdx_workshop.cpp) + loaded-asset registry containing-range lookup
+// (port/AssetLoader.cpp), for the per-tile atlas override hook at the LoadBlock/LoadTile
+// loaded.addr assignment sites.
+extern "C" int gdx_workshop_texture_packs_enabled(void);
+extern "C" const char* GdxWorkshopLookupAtlasTileOverride(const char* baseKey, size_t byteOffset, int n64Fmt,
+                                                          int n64Siz, int width, int height);
+extern "C" const char* GDiffuser_LookupLoadedAssetKeyContaining(const void* addr, size_t* outByteOffset);
+
 void Interpreter::GdxDumpDecodedRgba32(int tile, const uint8_t* rgba32, uint32_t width, uint32_t height) {
     if (!gdx_workshop_texture_dump_enabled()) {
         return;
@@ -1007,10 +1018,14 @@ void Interpreter::ImportTextureRgba16(int textureUnit, int tile, bool importRepl
     }
     ApplyTileMaskExtent(mRdp, tile, width, height, /*maskAuthoritative=*/true);
 
-    // Bound the decode by memory actually readable at `addr` rather than by the recorded load
-    // size: slot bookkeeping can understate a load while DRAM still holds the full wrap period.
+    // HD replacements store the full upscaled image in size_bytes, and sampling below reaches
+    // source rows up to height * v_pixel_scale. The stock rowStrideBytes*height bound would only
+    // cover the first 1/scale_factor of the source image, so the bottom of the tile reads as black.
+    const bool hdReplacement = metadata->resource != nullptr &&
+                               (metadata->h_byte_scale != 1.0f || metadata->v_pixel_scale != 1.0f);
     const uint32_t rowStrideBytes = (fullImageLineSizeBytes > 0) ? fullImageLineSizeBytes : (width * 2);
-    uint32_t readableBytes = (rowStrideBytes > 0 && height > 0) ? rowStrideBytes * height : sizeBytes;
+    uint32_t readableBytes = (rowStrideBytes > 0 && height > 0 && !hdReplacement) ? rowStrideBytes * height
+                                                                                  : sizeBytes;
 #ifdef _WIN32
     {
         MEMORY_BASIC_INFORMATION mbi;
@@ -1044,9 +1059,18 @@ void Interpreter::ImportTextureRgba16(int textureUnit, int tile, bool importRepl
     uint64_t transparentPixels = 0;
     uint64_t forcedOpaquePixels = 0;
 
+    // HD replacement textures are larger than the native tile. The clamp above keeps
+    // the GPU upload at the tile's logical size, but the source pixels must be sampled
+    // from the upscaled image (every Nth pixel) rather than cropped from the top-left.
     for (uint32_t y = 0; y < height; y++) {
         for (uint32_t x = 0; x < width; x++) {
-            uint32_t clrIdx = (y * (fullImageLineSizeBytes / 2)) + (x);
+            uint32_t srcX = x;
+            uint32_t srcY = y;
+            if (hdReplacement) {
+                srcX = static_cast<uint32_t>(x * metadata->h_byte_scale);
+                srcY = static_cast<uint32_t>(y * metadata->v_pixel_scale);
+            }
+            uint32_t clrIdx = (srcY * (fullImageLineSizeBytes / 2)) + srcX;
 
             uint16_t col16 = (clrIdx < maxTexel) ? ((addr[2 * clrIdx] << 8) | addr[2 * clrIdx + 1]) : 0;
             uint8_t a = col16 & 1;
@@ -2024,6 +2048,30 @@ void Interpreter::ImportTexture(int i, int tile, bool importReplacement) {
 
     if (TextureCacheLookup(i, key)) {
         return;
+    }
+
+    // [bg-tex] Race background layer cache miss: skybox (64x1 RGBA16), venue floor/clouds
+    // (64x32 RGBA16/IA), and sprites (64x64 CI4). Bounded to avoid drowning the trace.
+    if (gGdxRaceActive != 0) {
+        static int sBgUploadLogs = 0;
+        if (sBgUploadLogs < 48) {
+            const auto& tt = mRdp->texture_tile[tile];
+            const uint32_t tw = (tt.lrs >= tt.uls) ? (tt.lrs - tt.uls + 4u) / 4u : 0u;
+            const uint32_t th = (tt.lrt >= tt.ult) ? (tt.lrt - tt.ult + 4u) / 4u : 0u;
+            const bool isBgLike =
+                (tw == 64u) &&
+                (th == 1u || th == 32u || th == 64u) &&
+                ((fmt == G_IM_FMT_RGBA && siz == G_IM_SIZ_16b) ||
+                 (fmt == G_IM_FMT_IA && (siz == G_IM_SIZ_8b || siz == G_IM_SIZ_16b)) ||
+                 (fmt == G_IM_FMT_CI && siz == G_IM_SIZ_4b));
+            if (isBgLike) {
+                ++sBgUploadLogs;
+                gdx_cki("[bg-tex] upload miss tile", tile);
+                gdx_cki("[bg-tex] upload miss fmt_siz", (fmt << 4) | siz);
+                gdx_cki("[bg-tex] upload miss wh", (int)((tw << 16) | th));
+                gdx_cki("[bg-tex] upload miss addr", (int)(uintptr_t)origAddr);
+            }
+        }
     }
 
     if ((texFlags & TEX_FLAG_LOAD_AS_IMG) != 0) {
@@ -4275,6 +4323,68 @@ void Interpreter::StoreLoadedTexture(uint16_t tmemStart, const LoadedTexture& te
     }
 }
 
+/* Per-tile atlas texture override (devdocs/MODDING_ATLAS_DESIGN.md; mechanism corrected in
+   devdocs/POST_1_0_SCOPING.md "Per-tile atlas overrides"). Called at the two loaded.addr
+   assignment sites (LoadBlock / LoadTile) AFTER the band byte offset has been folded into
+   loaded.addr by the row/column math: the containing-range registry lookup recovers
+   (baseKey, byteOffset), and the workshop layer is queried for
+   "atlas/<baseKey>/o<byteOffset>/<FMT>/<W>x<H>". On a hit the slot is re-pointed at the pack OTEX
+   payload and raw_tex_metadata is filled exactly as if GfxDpSetTextureImage had served that OTEX,
+   so every importer works unchanged and metadata->resource != nullptr auto-skips the
+   TMEM-emulation decode branch. The caller must also skip its TMEM mirror (the band's texels no
+   longer come from DRAM). A miss leaves the slot untouched, so partial packs replace only the
+   bands they provide and the rest decode stock.
+
+   CI bands are refused here: a paletted atlas band has no palette side-channel at runtime (the
+   dumped swatch is a packer-side quantization target only), so CI atlas keys stay dump-only.
+   scaleLineSizes mirrors the two call sites' own OTR treatment of the scale fields: LoadTile
+   scales its line sizes by h_byte_scale; LoadBlock now does the same. */
+static bool GdxTryAtlasTileOverride(RDP* rdp, LoadedTexture& loaded, uint8_t loadTile, uint32_t bandWidth,
+                                    uint32_t bandHeight, bool scaleLineSizes) {
+    if (loaded.addr == nullptr || loaded.raw_tex_metadata.resource != nullptr || bandWidth == 0 || bandHeight == 0) {
+        return false;
+    }
+    const uint8_t fmt = rdp->texture_tile[loadTile].fmt;
+    const uint8_t siz = rdp->texture_to_load.siz;
+    if (fmt == G_IM_FMT_CI) {
+        return false;
+    }
+    if (!gdx_workshop_texture_packs_enabled()) {
+        return false;
+    }
+    size_t byteOffset = 0;
+    const char* baseKey = GDiffuser_LookupLoadedAssetKeyContaining(loaded.addr, &byteOffset);
+    if (baseKey == nullptr) {
+        return false;
+    }
+    const char* packPath =
+        GdxWorkshopLookupAtlasTileOverride(baseKey, byteOffset, fmt, siz, (int)bandWidth, (int)bandHeight);
+    if (packPath == nullptr) {
+        return false;
+    }
+    std::shared_ptr<Fast::Texture> tex = std::static_pointer_cast<Fast::Texture>(
+        Ship::Context::GetInstance()->GetResourceManager()->LoadResourceProcess(packPath));
+    if (tex == nullptr || tex->ImageData == nullptr) {
+        return false;
+    }
+    loaded.raw_tex_metadata.width = tex->Width;
+    loaded.raw_tex_metadata.height = tex->Height;
+    loaded.raw_tex_metadata.h_byte_scale = tex->HByteScale;
+    loaded.raw_tex_metadata.v_pixel_scale = tex->VPixelScale;
+    loaded.raw_tex_metadata.type = tex->Type;
+    loaded.raw_tex_metadata.resource = tex;
+    loaded.tex_flags = tex->Flags;
+    loaded.addr = reinterpret_cast<const uint8_t*>(tex->ImageData);
+    loaded.size_bytes =
+        static_cast<uint32_t>(loaded.orig_size_bytes * tex->HByteScale * tex->VPixelScale);
+    if (scaleLineSizes) {
+        loaded.line_size_bytes = static_cast<uint32_t>(loaded.line_size_bytes * tex->HByteScale);
+        loaded.full_image_line_size_bytes =
+            static_cast<uint32_t>(loaded.full_image_line_size_bytes * tex->HByteScale);
+    }
+    return true;
+}
+
 void Interpreter::GfxDpLoadBlock(uint8_t tile, uint32_t uls, uint32_t ult, uint32_t lrs, uint32_t dxt) {
     const auto byteCountForTexels = [](uint64_t texels, uint8_t siz) -> uint32_t {
         uint64_t bytes = 0;
@@ -4369,16 +4479,43 @@ void Interpreter::GfxDpLoadBlock(uint8_t tile, uint32_t uls, uint32_t ult, uint3
             source_line_bytes = transferLineBytes;
         }
     }
+
+    // HD pack whole-image replacements (e.g. 4x portraits) carry their real pixel
+    // dimensions in raw_tex_metadata. The stock SETTIMG width describes the logical
+    // (native) row, so the source stride must be multiplied by the horizontal upscale
+    // to step through the replacement's rows correctly.
+    const float h_byte_scale = mRdp->texture_to_load.raw_tex_metadata.h_byte_scale;
+    const float v_pixel_scale = mRdp->texture_to_load.raw_tex_metadata.v_pixel_scale;
+    if (h_byte_scale != 1.0f || v_pixel_scale != 1.0f) {
+        source_line_bytes = static_cast<uint32_t>(source_line_bytes * h_byte_scale);
+    }
+
     loaded.line_size_bytes = source_line_bytes;
     loaded.full_image_line_size_bytes = source_line_bytes;
     // assert(size_bytes <= 4096 && "bug: too big texture");
     loaded.tex_flags = mRdp->texture_to_load.tex_flags;
     loaded.raw_tex_metadata = mRdp->texture_to_load.raw_tex_metadata;
-    const size_t rowOffset = static_cast<size_t>(ult) * source_line_bytes;
-    const size_t columnOffset = byteCountForTexels(uls, mRdp->texture_to_load.siz);
+    // For upscaled replacements, the LOADBLOCK ult/uls are still in native texels;
+    // convert them to replacement texels before computing the source address.
+    const size_t rowOffset = static_cast<size_t>(ult) * static_cast<size_t>(v_pixel_scale) * source_line_bytes;
+    const size_t columnOffset =
+        static_cast<size_t>(byteCountForTexels(uls, mRdp->texture_to_load.siz) * h_byte_scale);
     loaded.addr = mRdp->texture_to_load.addr != nullptr
                       ? mRdp->texture_to_load.addr + rowOffset + columnOffset
                       : nullptr;
+    // Per-tile atlas override: keyed on the band's byte offset within its containing registered
+    // buffer, which the row/column math above has just baked into loaded.addr (the tile's uls/ult
+    // are normally 0 for per-glyph loads). Width 1 is the contiguous-line sentinel and carries no
+    // reliable band geometry, so those loads never redirect.
+    bool atlasOverridden = false;
+    {
+        const uint32_t bandWidth = mRdp->texture_to_load.width;
+        const uint32_t bandLineBytes = byteCountForTexels(bandWidth, mRdp->texture_to_load.siz);
+        if (bandWidth > 1 && bandLineBytes != 0 && orig_size_bytes % bandLineBytes == 0) {
+            atlasOverridden = GdxTryAtlasTileOverride(mRdp, loaded, tile, bandWidth,
+                                                      orig_size_bytes / bandLineBytes, /*scaleLineSizes=*/false);
+        }
+    }
     // fprintf(stderr, "GfxDpLoadBlock: line_size = 0x%x; orig = 0x%x; bpp=%d; lrs=%d\n", size_bytes,
     // orig_size_bytes,
     //         mRdp->texture_to_load.siz, lrs);
@@ -4398,8 +4535,10 @@ void Interpreter::GfxDpLoadBlock(uint8_t tile, uint32_t uls, uint32_t ult, uint3
 
     // Mirror the block transfer into emulated TMEM so import can decode purely from
     // tile-descriptor state. A straight byte copy is correct: the block load's DXT interleave
-    // cancels between a linear write at load time and a linear read at import time.
-    if (loaded.addr != nullptr) {
+    // cancels between a linear write at load time and a linear read at import time. An
+    // atlas-redirected slot is skipped: its texels come from the pack OTEX, not DRAM, and the
+    // resource != nullptr metadata already keeps the importers off the TMEM decode branch.
+    if (loaded.addr != nullptr && !atlasOverridden) {
         const uint32_t tmemByteOffset = static_cast<uint32_t>(tmemIndex) * 8u;
         if (tmemByteOffset < sizeof(mRdp->tmem)) {
             uint32_t copyBytes = std::min<uint32_t>(size_bytes, sizeof(mRdp->tmem) - tmemByteOffset);
@@ -4501,6 +4640,10 @@ void Interpreter::GfxDpLoadTile(uint8_t tile, uint32_t uls, uint32_t ult, uint32
     loaded.tex_flags = mRdp->texture_to_load.tex_flags;
     loaded.raw_tex_metadata = mRdp->texture_to_load.raw_tex_metadata;
     loaded.addr = mRdp->texture_to_load.addr != nullptr ? mRdp->texture_to_load.addr + start_offset_bytes : nullptr;
+    // Per-tile atlas override: start_offset_bytes is the band's byte offset within its containing
+    // registered buffer, now baked into loaded.addr. tile_width/tile_height are the band dims.
+    const bool atlasOverridden =
+        GdxTryAtlasTileOverride(mRdp, loaded, tile, tile_width, tile_height, /*scaleLineSizes=*/true);
 
     const std::string_view texPath =
         mRdp->texture_to_load.raw_tex_metadata.resource != nullptr
@@ -4517,8 +4660,11 @@ void Interpreter::GfxDpLoadTile(uint8_t tile, uint32_t uls, uint32_t ult, uint32
 
     // TMEM emulation: mirror the tile sub-rectangle into emulated TMEM row by
     // row. Destination rows advance at the 8-byte-aligned tile line stride,
-    // matching how the hardware packs LoadTile rows.
-    if (loaded.addr != nullptr) {
+    // matching how the hardware packs LoadTile rows. An atlas-redirected slot is
+    // skipped: its texels come from the pack OTEX, not DRAM, and the
+    // resource != nullptr metadata already keeps the importers off the TMEM
+    // decode branch.
+    if (loaded.addr != nullptr && !atlasOverridden) {
         const uint32_t tmemByteOffset = static_cast<uint32_t>(tmemIndex) * 8u;
         const uint32_t destStride = (tile_line_size_bytes + 7u) & ~7u;
         if (tmemByteOffset < sizeof(mRdp->tmem) && destStride != 0) {
@@ -6974,6 +7120,69 @@ void Interpreter::SpReset() {
     CalculateNormalDir(&mRsp->lookat[1], mRsp->current_lookat_coeffs[1]);
 }
 
+// [interp-idem] Hermetic replay baseline for frame-interpolation sub-frame passes (k > 0).
+// SpReset() already covers the RSP subset; this zeroes the RDP side that survives Run() --
+// TMEM and its generation counter, per-word load bookkeeping, palette staging, tile
+// descriptors, rasterizer modes, color registers, chroma-key state -- plus the renderer's
+// tracked binding state so the first command of the replay re-applies everything. Starting
+// from a clean DEFAULT state (rather than rewinding to pass 0's start) is deliberate: it keeps
+// loaded_texture[] free of stale resource handles and keeps the emulated TMEM/generation pair
+// in sync with the content-keyed GPU texture cache, which re-executed loads hit instead of
+// re-uploading. The GPU cache itself, framebuffer attachments, and mFbActive are untouched:
+// StartFrame() re-establishes them at the top of every DrawAndRunGraphicsCommands pass.
+void Interpreter::ResetRdpForReplay() {
+    if (mRsp != nullptr) {
+        // geometry_mode carries G_CULL_BACK/FRONT, G_LIGHTING, G_FOG, G_TEXTURE_GEN and is read
+        // for the cull test; SpReset() deliberately does not clear it because a task may rely on
+        // mode set by an earlier task in the same frame. A replay must not inherit pass 0's END
+        // state, so the replay baseline clears it here.
+        mRsp->geometry_mode = 0;
+    }
+    if (mRdp == nullptr) {
+        return;
+    }
+    std::memset(mRdp->tmem, 0, sizeof(mRdp->tmem));
+    mRdp->tmem_generation = 0;
+    for (auto& lt : mRdp->loaded_texture) {
+        lt = {};
+    }
+    std::memset(mRdp->palette_staging, 0, sizeof(mRdp->palette_staging));
+    mRdp->palettes[0] = mRdp->palettes[1] = nullptr;
+    mRdp->palette_dram_addr[0] = mRdp->palette_dram_addr[1] = nullptr;
+    mRdp->texture_to_load = {};
+    for (auto& tile : mRdp->texture_tile) {
+        tile = {};
+    }
+    mRdp->textures_changed[0] = mRdp->textures_changed[1] = false;
+    mRdp->first_tile_index = 0;
+    mRdp->other_mode_l = 0;
+    mRdp->other_mode_h = 0;
+    mRdp->combine_mode = 0;
+    mRdp->grayscale = false;
+    mRdp->prim_lod_fraction = 0;
+    mRdp->prim_depth = 0;
+    mRdp->env_color = {};
+    mRdp->prim_color = {};
+    mRdp->fog_color = {};
+    mRdp->blend_color = {};
+    mRdp->fill_color = {};
+    mRdp->grayscale_color = {};
+    mRdp->key_center = {};
+    mRdp->key_scale = {};
+    for (int16_t& k : mRdp->convert_k) {
+        k = 0;
+    }
+    mRdp->viewport = {};
+    mRdp->scissor = {};
+    mRdp->viewport_or_scissor_changed = true;
+
+    // Renderer-side tracked state: drop cached texture-node bindings and sampler validity so a
+    // replay cannot reuse pass 0's "currently bound" knowledge after its emulated inputs were
+    // just zeroed. Cache entries themselves stay alive and uploaded; only the tracking resets.
+    std::fill(std::begin(mRenderingState.mTextures), std::end(mRenderingState.mTextures), nullptr);
+    std::fill(std::begin(mRenderingState.sampler_valid), std::end(mRenderingState.sampler_valid), false);
+}
+
 void Interpreter::RegisterFbTexture(const void* cpuAddr, int fbId) {
     mFbTextures[(uintptr_t)cpuAddr] = fbId;
 }
@@ -7111,6 +7320,86 @@ void Interpreter::StartFrame() {
     mWidescreenUiCache = CVarGetInteger("gEnhancements.Graphics.WidescreenUI", 0) != 0;
     mUltrawideCache = CVarGetInteger("gEnhancements.Graphics.UltrawideMode", 0) != 0;
     mRemoveBordersCache = CVarGetInteger("gEnhancements.Graphics.RemoveBorders", 0) != 0;
+    mPostShaderCache = CVarGetInteger("gEnhancements.Graphics.CRTShader", 0);
+    // A selected custom shader must also force the offscreen path; the mode value stored here is
+    // only passed to the backend for built-in modes, while the backend reads the CustomShader CVar
+    // directly when it is non-empty.
+    if (mPostShaderCache == 0 && CVarGetString("gEnhancements.Graphics.CustomShader", "")[0] != '\0') {
+        mPostShaderCache = 1;
+    }
+    // An active .slangp pipeline or loose .slang shader forces the offscreen path too. The
+    // preset is parsed here so a compile or parse error is logged once and the frame falls back
+    // to the unfiltered source.
+    const char* postPipelineCVar = CVarGetString("gEnhancements.Graphics.PostPipeline", "");
+    mPostPipelineCache = postPipelineCVar != nullptr ? postPipelineCVar : "";
+    // Tracing a stored selection that reverts across runs; temporary for 1.1.0 RC.
+    static std::string sLastLoggedPostPipeline = "\x01";
+    if (mPostPipelineCache != sLastLoggedPostPipeline) {
+        SPDLOG_INFO("PostPipeline latched '{}' (was '{}')", mPostPipelineCache,
+                    sLastLoggedPostPipeline == "\x01" ? "<unset>" : sLastLoggedPostPipeline);
+        sLastLoggedPostPipeline = mPostPipelineCache;
+    }
+    const int builtinPostMode = mPostShaderCache;
+    if (!mPostPipelineCache.empty()) {
+        mPostShaderCache = 1;
+        const std::filesystem::path appDir = Ship::Context::GetAppDirectoryPath();
+        const bool isLooseSlang =
+            mPostPipelineCache.size() > 6 && mPostPipelineCache.compare(mPostPipelineCache.size() - 6, 6, ".slang") == 0;
+        const std::filesystem::path presetPath = GdxResolvePostShaderPath(appDir, mPostPipelineCache);
+        bool needParse = true;
+        if (mPostPipeline != nullptr && mPostPipeline->presetPath == presetPath) {
+            needParse = GdxPostShaderPipelineChanged(*mPostPipeline);
+        }
+        if (mPostPipeline == nullptr && mPostPipelineFailedPath == presetPath) {
+            // Previously failed; only retry when the file was touched since.
+            needParse = GdxGetMtime(presetPath) != mPostPipelineFailedMtime;
+        }
+        if (needParse) {
+            auto newPipeline = std::make_unique<GdxPostShaderPipeline>();
+            std::string error;
+            bool ok = false;
+            if (isLooseSlang) {
+                // A loose .slang file is treated as a one-pass pipeline at source scale.
+                if (std::filesystem::is_regular_file(presetPath)) {
+                    GdxPostPassDesc pass;
+                    pass.shader = presetPath.stem().string();
+                    newPipeline->presetPath = presetPath;
+                    newPipeline->mtime = GdxGetMtime(presetPath);
+                    newPipeline->passes.push_back(std::move(pass));
+                    ok = true;
+                } else {
+                    error = "Loose slang shader not found: " + presetPath.string();
+                }
+            } else {
+                // A pathological preset must not take the game down; a failed parse
+                // is cached below and the frame renders unfiltered.
+                try {
+                    ok = GdxParsePostShaderPipeline(presetPath, newPipeline.get(), &error);
+                } catch (const std::exception& e) {
+                    error = e.what();
+                } catch (...) {
+                    error = "unknown exception";
+                }
+            }
+            if (ok) {
+                mPostPipeline = std::move(newPipeline);
+                mPostPipelineFailedPath.clear();
+            } else {
+                mPostPipeline.reset();
+                mPostPipelineFailedPath = presetPath.generic_string();
+                mPostPipelineFailedMtime = GdxGetMtime(presetPath);
+                SPDLOG_ERROR("Failed to parse post pipeline '{}': {}", mPostPipelineCache, error);
+            }
+        }
+        // A preset that failed to load — fresh parse failure or a cached one skipped above —
+        // must not keep the forced built-in mode; restore the built-in selector's mode.
+        if (mPostPipeline == nullptr) {
+            mPostShaderCache = builtinPostMode;
+        }
+    } else {
+        mPostPipeline.reset();
+        mPostPipelineFailedPath.clear();
+    }
     // HudMaxAspect: 0 or any out-of-range value means no clamp, so ANCHOR-scoped HUD elements
     // glue to the true screen corners. A value in [4:3, 8) confines the HUD to a centred band of
     // that aspect.
@@ -7120,7 +7409,7 @@ void Interpreter::StartFrame() {
     }
     const bool widescreenPillarbox = !mWidescreenEnabledCache || mForceFixedAspectCache;
     sGameFbMsaaResolvedSized = false;
-    if (!ViewportMatchesRendererResolution() || mMsaaLevel > 1 || widescreenPillarbox) {
+    if (!ViewportMatchesRendererResolution() || mMsaaLevel > 1 || widescreenPillarbox || mPostShaderCache != 0) {
         mRendersToFb = true;
         if (!ViewportMatchesRendererResolution() || (widescreenPillarbox && mMsaaLevel <= 1)) {
             mRapi->UpdateFramebufferParameters(mGameFb, mCurDimensions.width, mCurDimensions.height, mMsaaLevel, true,
@@ -7134,9 +7423,14 @@ void Interpreter::StartFrame() {
         // The MSAA resolve target must also exist when a whole-frame pillarbox is required: the
         // epilogue resolves into it and publishes it as mGfxFrameBuffer so DrawGame composites the
         // centred 4:3 region. Resolving straight to the window would stretch 4:3 content across it.
-        if (mMsaaLevel > 1 && (!ViewportMatchesRendererResolution() || widescreenPillarbox)) {
+        // The post shader needs it too: with a post mode on there is no direct-to-window resolve,
+        // because the window backbuffer has no texture for the post pass to sample.
+        if (mMsaaLevel > 1 && (!ViewportMatchesRendererResolution() || widescreenPillarbox || mPostShaderCache != 0)) {
+            // Store the resolve target top-down so DrawGame's ImGui::Image path presents it the
+            // same way as the non-MSAA offscreen framebuffer (mGameFb is also top-down in these
+            // branches). ResolveMSAAColorBuffer now flips when src/dst invertY differ.
             mRapi->UpdateFramebufferParameters(mGameFbMsaaResolved, mCurDimensions.width, mCurDimensions.height, 1,
-                                               false, false, false, false);
+                                               true, false, false, false);
             sGameFbMsaaResolvedSized = true;
         }
     } else {
@@ -7174,8 +7468,9 @@ void Interpreter::RunGuiOnly() {
         const bool widescreenPillarbox = !mWidescreenEnabledCache || mForceFixedAspectCache;
         mRapi->StartDrawToFramebuffer(0, 1);
         mRapi->ClearFramebuffer(true, true);
+        int postSrcFb = -1;
         if (mMsaaLevel > 1) {
-            if (ViewportMatchesRendererResolution() && !widescreenPillarbox) {
+            if (ViewportMatchesRendererResolution() && !widescreenPillarbox && mPostShaderCache == 0) {
                 // Normal path: resolve straight to the window; mGfxFrameBuffer stays
                 // 0 and DrawGame presents it directly.
                 mRapi->ResolveMSAAColorBuffer(0, mGameFb);
@@ -7184,6 +7479,7 @@ void Interpreter::RunGuiOnly() {
                 // composites (pillarboxes) it instead of stretching.
                 mRapi->ResolveMSAAColorBuffer(mGameFbMsaaResolved, mGameFb);
                 mGfxFrameBuffer = (uintptr_t)mRapi->GetFramebufferTextureId(mGameFbMsaaResolved);
+                postSrcFb = mGameFbMsaaResolved;
             } else {
                 // A config flip after StartFrame requested the offscreen resolve, but
                 // mGameFbMsaaResolved was never sized this frame; resolve to 0 rather
@@ -7192,6 +7488,33 @@ void Interpreter::RunGuiOnly() {
             }
         } else {
             mGfxFrameBuffer = (uintptr_t)mRapi->GetFramebufferTextureId(mGameFb);
+            postSrcFb = mGameFb;
+        }
+        if (mPostShaderCache != 0 && postSrcFb >= 0) {
+            // The post target matches the source framebuffer's size, which StartFrame sized to
+            // mCurDimensions for offscreen-ratio renders and to the window otherwise. DrawGame's
+            // rect math reads only mCurDimensions' aspect, so either size composites the same.
+            uint32_t postOutW, postOutH;
+            if (postSrcFb == mGameFbMsaaResolved || !ViewportMatchesRendererResolution() || widescreenPillarbox) {
+                postOutW = mCurDimensions.width;
+                postOutH = mCurDimensions.height;
+            } else {
+                postOutW = mGfxCurrentWindowDimensions.width;
+                postOutH = mGfxCurrentWindowDimensions.height;
+            }
+            uintptr_t postTex = 0;
+            if (mPostPipeline != nullptr) {
+                postTex = mRapi->ApplyPostShaderChain(postSrcFb, *mPostPipeline, mNativeDimensions.width,
+                                                      mNativeDimensions.height, postOutW, postOutH);
+            } else {
+                postTex = mRapi->ApplyPostShader(postSrcFb, mPostShaderCache, mNativeDimensions.width,
+                                                 mNativeDimensions.height, postOutW, postOutH);
+            }
+            // 0 means the backend declined (unsupported or compile failed); keep the
+            // unfiltered source published rather than break presentation.
+            if (postTex != 0) {
+                mGfxFrameBuffer = postTex;
+            }
         }
     } else if (mFbActive) {
         // Failsafe reset to main framebuffer to prevent softlocking the renderer
@@ -7224,7 +7547,8 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
     // caught by the epilogue's fallback branch.
     {
         const bool widescreenPillarbox = !mWidescreenEnabledCache || mForceFixedAspectCache;
-        const bool rendersToFb = !ViewportMatchesRendererResolution() || mMsaaLevel > 1 || widescreenPillarbox;
+        const bool rendersToFb =
+            !ViewportMatchesRendererResolution() || mMsaaLevel > 1 || widescreenPillarbox || mPostShaderCache != 0;
         if (rendersToFb && !mRendersToFb && mMsaaLevel <= 1) {
             // StartFrame never sized mGameFb this frame; reproduce its non-MSAA
             // sizing so the freshly-targeted offscreen render matches the window.
@@ -7292,8 +7616,9 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
         const bool widescreenPillarbox = !mWidescreenEnabledCache || mForceFixedAspectCache;
         mRapi->StartDrawToFramebuffer(0, 1);
         mRapi->ClearFramebuffer(true, true);
+        int postSrcFb = -1;
         if (mMsaaLevel > 1) {
-            if (ViewportMatchesRendererResolution() && !widescreenPillarbox) {
+            if (ViewportMatchesRendererResolution() && !widescreenPillarbox && mPostShaderCache == 0) {
                 // Normal path: resolve straight to the window; mGfxFrameBuffer stays
                 // 0 and DrawGame presents it directly.
                 mRapi->ResolveMSAAColorBuffer(0, mGameFb);
@@ -7302,6 +7627,7 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
                 // composites the centred 4:3 region (gated on mGfxFrameBuffer != 0).
                 mRapi->ResolveMSAAColorBuffer(mGameFbMsaaResolved, mGameFb);
                 mGfxFrameBuffer = (uintptr_t)mRapi->GetFramebufferTextureId(mGameFbMsaaResolved);
+                postSrcFb = mGameFbMsaaResolved;
             } else {
                 // The mode flipped to pillarbox after StartFrame, so the offscreen
                 // target is not allocated this frame. Resolve to 0 for one frame
@@ -7311,6 +7637,33 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
             }
         } else {
             mGfxFrameBuffer = (uintptr_t)mRapi->GetFramebufferTextureId(mGameFb);
+            postSrcFb = mGameFb;
+        }
+        if (mPostShaderCache != 0 && postSrcFb >= 0) {
+            // The post target matches the source framebuffer's size, which StartFrame sized to
+            // mCurDimensions for offscreen-ratio renders and to the window otherwise. DrawGame's
+            // rect math reads only mCurDimensions' aspect, so either size composites the same.
+            uint32_t postOutW, postOutH;
+            if (postSrcFb == mGameFbMsaaResolved || !ViewportMatchesRendererResolution() || widescreenPillarbox) {
+                postOutW = mCurDimensions.width;
+                postOutH = mCurDimensions.height;
+            } else {
+                postOutW = mGfxCurrentWindowDimensions.width;
+                postOutH = mGfxCurrentWindowDimensions.height;
+            }
+            uintptr_t postTex = 0;
+            if (mPostPipeline != nullptr) {
+                postTex = mRapi->ApplyPostShaderChain(postSrcFb, *mPostPipeline, mNativeDimensions.width,
+                                                      mNativeDimensions.height, postOutW, postOutH);
+            } else {
+                postTex = mRapi->ApplyPostShader(postSrcFb, mPostShaderCache, mNativeDimensions.width,
+                                                 mNativeDimensions.height, postOutW, postOutH);
+            }
+            // 0 means the backend declined (unsupported or compile failed); keep the
+            // unfiltered source published rather than break presentation.
+            if (postTex != 0) {
+                mGfxFrameBuffer = postTex;
+            }
         }
     } else if (mFbActive) {
         // Failsafe reset to main framebuffer to prevent softlocking the renderer

@@ -24,6 +24,7 @@ class GfxWindowBackendSDL2 final : public GfxWindowBackend {
     bool GetMouseState(uint32_t btn) override;
     void SetMouseCapture(bool capture) override;
     bool IsMouseCaptured() override;
+    void SetMouseGrab(bool grab) override;
     void GetDimensions(uint32_t* width, uint32_t* height, int32_t* posX, int32_t* posY) override;
     void SetDimensions(uint32_t width, uint32_t height, int32_t posX, int32_t posY) override;
     Ship::WindowRect GetPrimaryMonitorRect() override;
@@ -54,6 +55,7 @@ class GfxWindowBackendSDL2 final : public GfxWindowBackend {
 
     SDL_Window* mWnd;
     SDL_Rect mCursorClip;
+    bool mIsMouseGrabbed;
     SDL_GLContext mCtx;
     SDL_Renderer* mRenderer;
     int mSdlToLusTable[512];

@@ -5,8 +5,14 @@
 #include <cmath>
 
 #include <chrono>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <map>
+#include <regex>
+#include <sstream>
 #include <stdexcept>
+#include <thread>
 #include <unordered_map>
 
 #include <windows.h>
@@ -15,6 +21,7 @@
 
 #include <dxgi1_3.h>
 #include <d3d11.h>
+#include <d3d11sdklayers.h>
 #include <d3dcompiler.h>
 
 #ifndef _LANGUAGE_C
@@ -33,9 +40,11 @@
 #include "fast/Fast3dGui.h"
 #include "ship/Context.h"
 #include "ship/config/ConsoleVariable.h"
+#include "libultraship/bridge/consolevariablebridge.h"
 #include "ship/window/Window.h"
 
 #include "fast/backends/gfx_rendering_api.h"
+#include "fast/backends/gfx_post_shader_pipeline.h"
 #include "fast/interpreter.h"
 
 #include <prism/processor.h>
@@ -43,9 +52,15 @@
 #include <ship/resource/factory/ShaderFactory.h>
 #include <ship/resource/ResourceManager.h>
 #include "spdlog/spdlog.h"
+#include <spdlog/fmt/fmt.h>
 #include "nlohmann/json.hpp"
+#include <stb_image.h>
 
 #define DEBUG_D3D 0
+
+// Temporary diagnostic: set to 1 to drain the D3D11 debug info queue into the
+// log after each post-pipeline chain draw. Requires DEBUG_D3D 1.
+#define DEBUG_D3D_CHAIN_INFOQUEUE 0
 
 using namespace Microsoft::WRL; // For ComPtr
 
@@ -69,7 +84,265 @@ static size_t GetVertexFloatCount(const CCFeatures& ccFeatures) {
     return count;
 }
 
+// CRT post-process pass (gEnhancements.Graphics.CRTShader / CustomShader). The vertex shader is
+// attribute-less: a fullscreen triangle generated from SV_VertexID so the pass cannot leave stale
+// vertex-buffer state behind for the next frame's first combiner draw.
+static const char* sGdxPostVsSource = R"(
+struct VSOutput {
+    float4 pos : SV_Position;
+    float2 vUV : TEXCOORD0;
+};
+// aDummy exists only so the input signature has one element: CreateInputLayout with zero
+// elements returns E_INVALIDARG on some drivers, while a single declared-and-unbound
+// attribute reads as zero everywhere. The triangle geometry still comes from SV_VertexID.
+VSOutput VSMain(uint id : SV_VertexID, float2 aDummy : POSITION) {
+    VSOutput o;
+    float2 p = float2(id == 1 ? 3.0 : -1.0, id == 2 ? 3.0 : -1.0);
+    o.pos = float4(p, 0.0, 1.0);
+    o.vUV = p * 0.5 + 0.5;
+    return o;
+}
+)";
+
+static const char* sGdxPostCopyPsSource = R"(
+Texture2D uTex : register(t0);
+SamplerState uSampler : register(s0);
+struct PSInput {
+    float4 pos : SV_Position;
+    float2 vUV : TEXCOORD0;
+};
+float4 PSMain(PSInput input) : SV_Target {
+    return uTex.Sample(uSampler, input.vUV);
+}
+)";
+
+// uSrcSize is the native N64 resolution the downsample target holds: scanlines key on source
+// rows, not output pixels, so the line count stays authentic at any window size.
+static const char* sGdxPostFsScanlines = R"(
+Texture2D uTex : register(t0);
+SamplerState uTexSampler : register(s0);
+cbuffer PostCB : register(b0) {
+    float2 uSrcSize;
+    float2 uOutSize;
+};
+struct PSInput {
+    float4 pos : SV_Position;
+    float2 vUV : TEXCOORD0;
+};
+float4 PSMain(PSInput input) : SV_Target {
+    float3 color = uTex.Sample(uTexSampler, input.vUV).rgb;
+    float scan = 0.80 + 0.20 * cos(6.2831853 * (frac(input.vUV.y * uSrcSize.y) - 0.5));
+    return float4(color * scan, 1.0);
+}
+)";
+
+// Scanlines plus an aperture-grille mask: each output column keeps one channel at full gain.
+// The gamma lift recovers the brightness the mask and scanlines remove.
+static const char* sGdxPostFsCrt = R"(
+Texture2D uTex : register(t0);
+SamplerState uTexSampler : register(s0);
+cbuffer PostCB : register(b0) {
+    float2 uSrcSize;
+    float2 uOutSize;
+};
+struct PSInput {
+    float4 pos : SV_Position;
+    float2 vUV : TEXCOORD0;
+};
+float4 PSMain(PSInput input) : SV_Target {
+    float3 color = uTex.Sample(uTexSampler, input.vUV).rgb;
+    float scan = 0.80 + 0.20 * cos(6.2831853 * (frac(input.vUV.y * uSrcSize.y) - 0.5));
+    float phase = fmod(floor(input.vUV.x * uOutSize.x), 3.0);
+    float3 mask = float3(0.75, 0.75, 0.75);
+    if (phase < 0.5) {
+        mask.r = 1.0;
+    } else if (phase < 1.5) {
+        mask.g = 1.0;
+    } else {
+        mask.b = 1.0;
+    }
+    color = pow(color * scan * mask, 0.85);
+    return float4(color, 1.0);
+}
+)";
+
+static const char* sGdxPostCustomPrelude = R"(
+Texture2D uTex : register(t0);
+SamplerState uTexSampler : register(s0);
+cbuffer PostCB : register(b0) {
+    float2 uSrcSize;
+    float2 uOutSize;
+};
+struct PSInput {
+    float4 pos : SV_Position;
+    float2 vUV : TEXCOORD0;
+};
+)";
+
+// Worker-thread half of post-shader compilation: D3DCompile is free-threaded, so the expensive
+// source->bytecode step runs off the render thread. Device object creation stays on the main
+// thread in GdxCreatePostProgramObjectsD3D11.
+static bool GdxCompilePostShaderBlobsD3D11(pD3DCompile compileFn, const char* vsSource, const char* psSource,
+                                           const char* pixelShaderProfile, ID3DBlob** outVs, ID3DBlob** outPs) {
+#if DEBUG_D3D
+    UINT compileFlags = D3DCOMPILE_DEBUG;
+#else
+    UINT compileFlags = D3DCOMPILE_OPTIMIZATION_LEVEL2;
+#endif
+    ComPtr<ID3DBlob> errorBlob;
+    HRESULT hr = compileFn(vsSource, strlen(vsSource), nullptr, nullptr, nullptr, "VSMain", "vs_4_0", compileFlags, 0,
+                           outVs, errorBlob.GetAddressOf());
+    if (FAILED(hr) || *outVs == nullptr) {
+        const char* err = errorBlob ? (const char*)errorBlob->GetBufferPointer() : "unknown error";
+        SPDLOG_ERROR("Post vertex shader compilation failed: {}", err);
+        return false;
+    }
+
+    hr = compileFn(psSource, strlen(psSource), nullptr, nullptr, nullptr, "PSMain", pixelShaderProfile, compileFlags, 0,
+                   outPs, errorBlob.ReleaseAndGetAddressOf());
+    if (FAILED(hr) || *outPs == nullptr) {
+        const char* err = errorBlob ? (const char*)errorBlob->GetBufferPointer() : "unknown error";
+        SPDLOG_ERROR("Post pixel shader compilation failed: {}", err);
+        return false;
+    }
+    return true;
+}
+
+static bool GdxCompilePostShaderD3D11(GfxRenderingAPIDX11* self, const char* vsSource, const char* psSource,
+                                      GfxRenderingAPIDX11::PostShaderProgramD3D11* outProgram, bool needsConstantBuffer,
+                                      D3D11_FILTER samplerFilter = D3D11_FILTER_MIN_MAG_MIP_POINT,
+                                      D3D11_TEXTURE_ADDRESS_MODE wrapU = D3D11_TEXTURE_ADDRESS_CLAMP,
+                                      D3D11_TEXTURE_ADDRESS_MODE wrapV = D3D11_TEXTURE_ADDRESS_CLAMP,
+                                      uint32_t constantBufferSize = 16,
+                                      const char* pixelShaderProfile = "ps_4_0") {
+    ComPtr<ID3DBlob> vs, ps;
+    if (!GdxCompilePostShaderBlobsD3D11(self->mD3dCompile, vsSource, psSource, pixelShaderProfile,
+                                        vs.GetAddressOf(), ps.GetAddressOf())) {
+        return false;
+    }
+    return GdxCreatePostProgramObjectsD3D11(self, vs.Get(), ps.Get(), outProgram, needsConstantBuffer, samplerFilter,
+                                            wrapU, wrapV, constantBufferSize);
+}
+
+static bool GdxCreatePostProgramObjectsD3D11(GfxRenderingAPIDX11* self, ID3DBlob* vsBlob, ID3DBlob* psBlob,
+                                             GfxRenderingAPIDX11::PostShaderProgramD3D11* outProgram,
+                                             bool needsConstantBuffer, D3D11_FILTER samplerFilter,
+                                             D3D11_TEXTURE_ADDRESS_MODE wrapU, D3D11_TEXTURE_ADDRESS_MODE wrapV,
+                                             uint32_t constantBufferSize) {
+    if (FAILED(self->mDevice->CreateVertexShader(vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), nullptr,
+                                                 outProgram->vertex_shader.GetAddressOf()))) {
+        SPDLOG_ERROR("Post vertex shader creation failed");
+        return false;
+    }
+    if (FAILED(self->mDevice->CreatePixelShader(psBlob->GetBufferPointer(), psBlob->GetBufferSize(), nullptr,
+                                                outProgram->pixel_shader.GetAddressOf()))) {
+        SPDLOG_ERROR("Post pixel shader creation failed");
+        return false;
+    }
+
+    // The vertex shader generates the fullscreen triangle from SV_VertexID and declares one
+    // unused POSITION attribute (see sGdxPostVsSource): a zero-element layout is rejected by
+    // some drivers, while this single-element layout with no vertex buffer bound reads the
+    // attribute as zero on every backend. Binding a real POSITION/TEXCOORD pair would instead
+    // mismatch shaders that only consume vUV.
+    static const D3D11_INPUT_ELEMENT_DESC kPostDummyLayout = {"POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0,
+                                                              D3D11_INPUT_PER_VERTEX_DATA, 0};
+    if (FAILED(self->mDevice->CreateInputLayout(&kPostDummyLayout, 1, vsBlob->GetBufferPointer(),
+                                                vsBlob->GetBufferSize(), outProgram->input_layout.GetAddressOf()))) {
+        SPDLOG_ERROR("Post input layout creation failed");
+        return false;
+    }
+
+    if (needsConstantBuffer) {
+        D3D11_BUFFER_DESC cbDesc;
+        ZeroMemory(&cbDesc, sizeof(cbDesc));
+        cbDesc.ByteWidth = constantBufferSize;
+        cbDesc.Usage = D3D11_USAGE_DYNAMIC;
+        cbDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        cbDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        if (FAILED(self->mDevice->CreateBuffer(&cbDesc, nullptr, outProgram->constant_buffer.GetAddressOf()))) {
+            SPDLOG_ERROR("Post constant buffer creation failed");
+            return false;
+        }
+    }
+
+    D3D11_SAMPLER_DESC samplerDesc;
+    ZeroMemory(&samplerDesc, sizeof(samplerDesc));
+    samplerDesc.Filter = samplerFilter;
+    samplerDesc.AddressU = wrapU;
+    samplerDesc.AddressV = wrapV;
+    samplerDesc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    samplerDesc.MinLOD = -D3D11_FLOAT32_MAX;
+    samplerDesc.MaxLOD = D3D11_FLOAT32_MAX;
+    if (FAILED(self->mDevice->CreateSamplerState(&samplerDesc, outProgram->sampler_state.GetAddressOf()))) {
+        SPDLOG_ERROR("Post sampler state creation failed");
+        return false;
+    }
+
+    D3D11_BLEND_DESC blendDesc;
+    ZeroMemory(&blendDesc, sizeof(blendDesc));
+    blendDesc.RenderTarget[0].BlendEnable = FALSE;
+    blendDesc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+    if (FAILED(self->mDevice->CreateBlendState(&blendDesc, outProgram->blend_state.GetAddressOf()))) {
+        SPDLOG_ERROR("Post blend state creation failed");
+        return false;
+    }
+
+    D3D11_RASTERIZER_DESC rasterDesc;
+    ZeroMemory(&rasterDesc, sizeof(rasterDesc));
+    rasterDesc.FillMode = D3D11_FILL_SOLID;
+    rasterDesc.CullMode = D3D11_CULL_NONE;
+    rasterDesc.ScissorEnable = FALSE;
+    if (FAILED(self->mDevice->CreateRasterizerState(&rasterDesc, outProgram->rasterizer_state.GetAddressOf()))) {
+        SPDLOG_ERROR("Post rasterizer state creation failed");
+        return false;
+    }
+
+    return true;
+}
+
+static bool GdxCompilePostCopyShaderD3D11(GfxRenderingAPIDX11* self, GfxRenderingAPIDX11::PostShaderProgramD3D11* outProgram) {
+    return GdxCompilePostShaderD3D11(self, sGdxPostVsSource, sGdxPostCopyPsSource, outProgram, false,
+                                     D3D11_FILTER_MIN_MAG_MIP_LINEAR);
+}
+
+static bool GdxCompilePostModeShaderD3D11(GfxRenderingAPIDX11* self, int mode, GfxRenderingAPIDX11::PostShaderProgramD3D11* outProgram) {
+    return GdxCompilePostShaderD3D11(self, sGdxPostVsSource, mode == 1 ? sGdxPostFsScanlines : sGdxPostFsCrt,
+                                     outProgram, true);
+}
+
+// Rate-limited INFO logging for the post-pass hot path so the active shader is visible without
+// spamming the log on every frame.
+static void GdxLogPostShaderInfo(const std::string& message) {
+    static auto sLastLog = std::chrono::steady_clock::now();
+    auto now = std::chrono::steady_clock::now();
+    if (std::chrono::duration_cast<std::chrono::seconds>(now - sLastLog).count() >= 3) {
+        sLastLog = now;
+        SPDLOG_INFO("[post-shader] {}", message);
+    }
+}
+
+static std::string GdxReadShaderFile(const std::filesystem::path& path) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        return "";
+    }
+    std::ostringstream ss;
+    ss << file.rdbuf();
+    std::string result = ss.str();
+    // Strip UTF-8 BOM so D3DCompile does not choke on it.
+    if (result.size() >= 3 && (unsigned char)result[0] == 0xEF && (unsigned char)result[1] == 0xBB &&
+        (unsigned char)result[2] == 0xBF) {
+        result.erase(0, 3);
+    }
+    return result;
+}
+
 GfxRenderingAPIDX11::~GfxRenderingAPIDX11() {
+    if (mPostPipelineBuild != nullptr) {
+        mPostPipelineBuild->cancel = true;
+        mPostPipelineBuild.reset();
+    }
 }
 
 GfxRenderingAPIDX11::GfxRenderingAPIDX11(GfxWindowBackendDXGI* backend) {
@@ -264,6 +537,7 @@ void GfxRenderingAPIDX11::Init() {
     // Create D3D Debug mDevice if in debug mode
 
 #if DEBUG_D3D
+    ComPtr<ID3D11Debug> debug;
     ThrowIfFailed(mDevice->QueryInterface(__uuidof(ID3D11Debug), (void**)debug.GetAddressOf()),
                   mWindowBackend->GetWindowHandle(), "Failed to get ID3D11Debug device.");
 #endif
@@ -991,6 +1265,7 @@ void GfxRenderingAPIDX11::StartFrame() {
                                  mPerAlphaThresholdCb.Get() };
     mContext->PSSetConstantBuffers(0, 4, buffers);
 
+    mFrameCount++;
     mPerFrameCbData.noise_frame++;
     if (mPerFrameCbData.noise_frame > 150) {
         // No high values, as noise starts to look ugly
@@ -1025,7 +1300,7 @@ int GfxRenderingAPIDX11::CreateFramebuffer() {
 
 void GfxRenderingAPIDX11::UpdateFramebufferParameters(int fb_id, uint32_t width, uint32_t height, uint32_t msaa_level,
                                                       bool opengl_invertY, bool render_target, bool has_depth_buffer,
-                                                      bool can_extract_depth) {
+                                                      bool can_extract_depth, GdxFramebufferFormat format) {
     FramebufferDX11& fb = mFrameBuffers[fb_id];
     TextureData& tex = mTextures[fb.texture_id];
 
@@ -1037,7 +1312,19 @@ void GfxRenderingAPIDX11::UpdateFramebufferParameters(int fb_id, uint32_t width,
         --msaa_level;
     }
 
-    bool diff = tex.width != width || tex.height != height || fb.msaa_level != msaa_level;
+    DXGI_FORMAT dxgiFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+    switch (format) {
+        case GdxFramebufferFormat::R16G16B16A16_FLOAT:
+            dxgiFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
+            break;
+        case GdxFramebufferFormat::R8G8B8A8_UNORM_SRGB:
+            dxgiFormat = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+            break;
+        default:
+            break;
+    }
+
+    bool diff = tex.width != width || tex.height != height || fb.msaa_level != msaa_level || tex.lastFormat != dxgiFormat;
     const bool update_depth_buffer =
         has_depth_buffer &&
         (diff || !fb.has_depth_buffer || (fb.depth_stencil_srv.Get() != nullptr) != can_extract_depth);
@@ -1051,7 +1338,7 @@ void GfxRenderingAPIDX11::UpdateFramebufferParameters(int fb_id, uint32_t width,
             texture_desc.Usage = D3D11_USAGE_DEFAULT;
             texture_desc.BindFlags =
                 (msaa_level <= 1 ? D3D11_BIND_SHADER_RESOURCE : 0) | (render_target ? D3D11_BIND_RENDER_TARGET : 0);
-            texture_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            texture_desc.Format = dxgiFormat;
             texture_desc.CPUAccessFlags = 0;
             texture_desc.MiscFlags = 0;
             texture_desc.ArraySize = 1;
@@ -1072,6 +1359,7 @@ void GfxRenderingAPIDX11::UpdateFramebufferParameters(int fb_id, uint32_t width,
                 ThrowIfFailed(
                     mDevice->CreateRenderTargetView(new_texture.Get(), nullptr, new_render_target_view.GetAddressOf()));
             }
+            tex.lastFormat = dxgiFormat;
 
             ComPtr<ID3D11DepthStencilView> new_depth_stencil_view;
             ComPtr<ID3D11ShaderResourceView> new_depth_stencil_srv;
@@ -1169,6 +1457,1170 @@ void GfxRenderingAPIDX11::ResolveMSAAColorBuffer(int fb_id_target, int fb_id_sou
 
 void* GfxRenderingAPIDX11::GetFramebufferTextureId(int fb_id) {
     return (void*)mTextures[mFrameBuffers[fb_id].texture_id].resource_view.Get();
+}
+
+uintptr_t GfxRenderingAPIDX11::ApplyPostShader(int srcFbId, int mode, uint32_t nativeW, uint32_t nativeH, uint32_t outW,
+                                               uint32_t outH) {
+    if (srcFbId <= 0 || srcFbId >= (int)mFrameBuffers.size() || nativeW == 0 || nativeH == 0 || outW == 0 ||
+        outH == 0) {
+        return 0;
+    }
+
+    const char* customStem = CVarGetString("gEnhancements.Graphics.CustomShader", "");
+    PostShaderProgramD3D11* prg = nullptr;
+
+    if (customStem != nullptr && customStem[0] != '\0') {
+        // Reject any path-separator characters so the CVar cannot escape the shaders/ directory.
+        if (strchr(customStem, '\\') != nullptr || strchr(customStem, '/') != nullptr ||
+            strchr(customStem, '.') != nullptr) {
+            SPDLOG_ERROR("Invalid custom shader stem '{}': must be a plain file name", customStem);
+            return 0;
+        }
+        std::filesystem::path shaderPath = std::filesystem::path(Ship::Context::GetAppDirectoryPath()) / "shaders" /
+                                           (std::string(customStem) + ".hlsl");
+        GdxLogPostShaderInfo(fmt::format("scan/select: custom stem '{}' -> {}", customStem, shaderPath.string()));
+        if (!std::filesystem::exists(shaderPath)) {
+            SPDLOG_ERROR("Custom shader file not found: {}", shaderPath.string());
+            return 0;
+        }
+        uint64_t mtimeTicks =
+            static_cast<uint64_t>(std::filesystem::last_write_time(shaderPath).time_since_epoch().count());
+        auto& entry = mPostShaderCustomCache[customStem];
+        if (!entry.program.attempted || entry.mtime != mtimeTicks) {
+            entry.mtime = mtimeTicks;
+            entry.program = {}; // drop any stale device objects before recompiling
+            entry.program.attempted = true;
+            std::string customSource = GdxReadShaderFile(shaderPath);
+            if (customSource.empty()) {
+                SPDLOG_ERROR("Custom shader file is empty or could not be read: {}", shaderPath.string());
+                return 0;
+            }
+            std::string fullSource = std::string(sGdxPostCustomPrelude) + customSource;
+            if (!GdxCompilePostShaderD3D11(this, sGdxPostVsSource, fullSource.c_str(), &entry.program, true)) {
+                SPDLOG_ERROR("Custom shader compile failed: {}", shaderPath.string());
+                return 0;
+            }
+            GdxLogPostShaderInfo(fmt::format("compile: custom shader '{}' compiled successfully",
+                                             shaderPath.string()));
+        }
+        prg = &entry.program;
+    } else {
+        if (mode < 1 || mode > 2) {
+            return 0;
+        }
+        PostShaderProgramD3D11& modePrg = mPostShaderPrograms[mode - 1];
+        if (!modePrg.attempted) {
+            modePrg.attempted = true;
+            if (!GdxCompilePostModeShaderD3D11(this, mode, &modePrg)) {
+                SPDLOG_ERROR("Built-in post shader mode {} compile failed", mode);
+                return 0;
+            }
+        }
+        prg = &modePrg;
+    }
+
+    if (prg == nullptr || prg->vertex_shader.Get() == nullptr) {
+        return 0;
+    }
+
+    if (!mPostCopyProgram.attempted) {
+        mPostCopyProgram.attempted = true;
+        if (!GdxCompilePostCopyShaderD3D11(this, &mPostCopyProgram)) {
+            SPDLOG_ERROR("Post copy shader compile failed");
+            return 0;
+        }
+    }
+    if (mPostCopyProgram.vertex_shader.Get() == nullptr) {
+        return 0;
+    }
+
+    if (mPostDownsampleFb < 0) {
+        mPostDownsampleFb = CreateFramebuffer();
+    }
+    if (mPostOutputFb < 0) {
+        mPostOutputFb = CreateFramebuffer();
+    }
+
+    UpdateFramebufferParameters(mPostDownsampleFb, nativeW, nativeH, 1, true, true, false, false);
+    UpdateFramebufferParameters(mPostOutputFb, outW, outH, 1, true, true, false, false);
+
+    // The post pass samples the downsample texture with NEAREST for crisp texels; the default
+    // framebuffer sampler is LINEAR from CreateFramebuffer.
+    {
+        uint32_t saved = mCurrentTextureIds[0];
+        mCurrentTextureIds[0] = mFrameBuffers[mPostDownsampleFb].texture_id;
+        SetSamplerParameters(0, false, G_TX_CLAMP, G_TX_CLAMP);
+        mCurrentTextureIds[0] = saved;
+    }
+
+    // Save device state so the interpreter's cached D3D11 state stays consistent with the context.
+    ComPtr<ID3D11RenderTargetView> prevRTV;
+    ComPtr<ID3D11DepthStencilView> prevDSV;
+    mContext->OMGetRenderTargets(1, prevRTV.GetAddressOf(), prevDSV.GetAddressOf());
+
+    D3D11_VIEWPORT prevViewport;
+    UINT numViewports = 1;
+    mContext->RSGetViewports(&numViewports, &prevViewport);
+
+    ComPtr<ID3D11VertexShader> prevVS;
+    ComPtr<ID3D11PixelShader> prevPS;
+    ComPtr<ID3D11GeometryShader> prevGS;
+    mContext->VSGetShader(prevVS.GetAddressOf(), nullptr, nullptr);
+    mContext->PSGetShader(prevPS.GetAddressOf(), nullptr, nullptr);
+    mContext->GSGetShader(prevGS.GetAddressOf(), nullptr, nullptr);
+
+    ComPtr<ID3D11InputLayout> prevIL;
+    mContext->IAGetInputLayout(prevIL.GetAddressOf());
+
+    ComPtr<ID3D11Buffer> prevVB;
+    UINT prevStride = 0, prevOffset = 0;
+    mContext->IAGetVertexBuffers(0, 1, prevVB.GetAddressOf(), &prevStride, &prevOffset);
+
+    D3D_PRIMITIVE_TOPOLOGY prevTopology;
+    mContext->IAGetPrimitiveTopology(&prevTopology);
+
+    ComPtr<ID3D11BlendState> prevBlend;
+    float prevBlendFactor[4] = {};
+    UINT prevSampleMask = 0xFFFFFFFF;
+    mContext->OMGetBlendState(prevBlend.GetAddressOf(), prevBlendFactor, &prevSampleMask);
+
+    ComPtr<ID3D11DepthStencilState> prevDepthStencil;
+    UINT prevStencilRef = 0;
+    mContext->OMGetDepthStencilState(prevDepthStencil.GetAddressOf(), &prevStencilRef);
+
+    ComPtr<ID3D11RasterizerState> prevRasterizer;
+    mContext->RSGetState(prevRasterizer.GetAddressOf());
+
+    ComPtr<ID3D11ShaderResourceView> prevSRV;
+    mContext->PSGetShaderResources(0, 1, prevSRV.GetAddressOf());
+
+    ComPtr<ID3D11SamplerState> prevSampler;
+    mContext->PSGetSamplers(0, 1, prevSampler.GetAddressOf());
+
+    ComPtr<ID3D11Buffer> prevCB;
+    mContext->PSGetConstantBuffers(0, 1, prevCB.GetAddressOf());
+
+    // Step 1: linear downsample of the rendered frame to native resolution.
+    {
+        FramebufferDX11& dstFb = mFrameBuffers[mPostDownsampleFb];
+        TextureData& srcTex = mTextures[mFrameBuffers[srcFbId].texture_id];
+        mContext->OMSetRenderTargets(1, dstFb.render_target_view.GetAddressOf(), nullptr);
+
+        D3D11_VIEWPORT viewport;
+        viewport.TopLeftX = 0.0f;
+        viewport.TopLeftY = 0.0f;
+        viewport.Width = static_cast<float>(nativeW);
+        viewport.Height = static_cast<float>(nativeH);
+        viewport.MinDepth = 0.0f;
+        viewport.MaxDepth = 1.0f;
+        mContext->RSSetViewports(1, &viewport);
+
+        mContext->IASetInputLayout(mPostCopyProgram.input_layout.Get());
+        mContext->VSSetShader(mPostCopyProgram.vertex_shader.Get(), nullptr, 0);
+        mContext->PSSetShader(mPostCopyProgram.pixel_shader.Get(), nullptr, 0);
+        mContext->PSSetShaderResources(0, 1, srcTex.resource_view.GetAddressOf());
+        mContext->PSSetSamplers(0, 1, mPostCopyProgram.sampler_state.GetAddressOf());
+        mContext->PSSetConstantBuffers(0, 0, nullptr);
+        mContext->OMSetBlendState(mPostCopyProgram.blend_state.Get(), nullptr, 0xFFFFFFFF);
+        mContext->OMSetDepthStencilState(nullptr, 0);
+        mContext->RSSetState(mPostCopyProgram.rasterizer_state.Get());
+        mContext->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        mContext->Draw(3, 0);
+    }
+
+    // Step 2: fullscreen triangle through the post shader into the output target.
+    {
+        FramebufferDX11& srcFb = mFrameBuffers[mPostDownsampleFb];
+        FramebufferDX11& dstFb = mFrameBuffers[mPostOutputFb];
+        TextureData& srcTex = mTextures[srcFb.texture_id];
+
+        GdxLogPostShaderInfo(fmt::format("apply: custom='{}' mode={} {}x{} -> {}x{}",
+                                          customStem != nullptr ? customStem : "", mode, nativeW, nativeH, outW, outH));
+
+        if (prg->constant_buffer.Get() != nullptr) {
+            D3D11_MAPPED_SUBRESOURCE ms;
+            float cbData[4] = { static_cast<float>(nativeW), static_cast<float>(nativeH),
+                                static_cast<float>(outW), static_cast<float>(outH) };
+            if (SUCCEEDED(mContext->Map(prg->constant_buffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &ms))) {
+                memcpy(ms.pData, cbData, sizeof(cbData));
+                mContext->Unmap(prg->constant_buffer.Get(), 0);
+            }
+            ID3D11Buffer* cb = prg->constant_buffer.Get();
+            mContext->PSSetConstantBuffers(0, 1, &cb);
+        }
+
+        mContext->OMSetRenderTargets(1, dstFb.render_target_view.GetAddressOf(), nullptr);
+
+        D3D11_VIEWPORT viewport;
+        viewport.TopLeftX = 0.0f;
+        viewport.TopLeftY = 0.0f;
+        viewport.Width = static_cast<float>(outW);
+        viewport.Height = static_cast<float>(outH);
+        viewport.MinDepth = 0.0f;
+        viewport.MaxDepth = 1.0f;
+        mContext->RSSetViewports(1, &viewport);
+
+        mContext->IASetInputLayout(prg->input_layout.Get());
+        mContext->VSSetShader(prg->vertex_shader.Get(), nullptr, 0);
+        mContext->PSSetShader(prg->pixel_shader.Get(), nullptr, 0);
+        mContext->PSSetShaderResources(0, 1, srcTex.resource_view.GetAddressOf());
+        mContext->PSSetSamplers(0, 1, prg->sampler_state.GetAddressOf());
+        mContext->OMSetBlendState(prg->blend_state.Get(), nullptr, 0xFFFFFFFF);
+        mContext->OMSetDepthStencilState(nullptr, 0);
+        mContext->RSSetState(prg->rasterizer_state.Get());
+        mContext->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        mContext->Draw(3, 0);
+    }
+
+    // Restore device state and invalidate backend caches so the next draw re-binds anything changed.
+    mContext->OMSetRenderTargets(1, prevRTV.GetAddressOf(), prevDSV.Get());
+    if (numViewports > 0) {
+        mContext->RSSetViewports(1, &prevViewport);
+    }
+    mContext->VSSetShader(prevVS.Get(), nullptr, 0);
+    mContext->PSSetShader(prevPS.Get(), nullptr, 0);
+    mContext->GSSetShader(prevGS.Get(), nullptr, 0);
+    mContext->IASetInputLayout(prevIL.Get());
+    mContext->IASetVertexBuffers(0, 1, prevVB.GetAddressOf(), &prevStride, &prevOffset);
+    mContext->IASetPrimitiveTopology(prevTopology);
+    mContext->OMSetBlendState(prevBlend.Get(), prevBlendFactor, prevSampleMask);
+    mContext->OMSetDepthStencilState(prevDepthStencil.Get(), prevStencilRef);
+    mContext->RSSetState(prevRasterizer.Get());
+    mContext->PSSetShaderResources(0, 1, prevSRV.GetAddressOf());
+    mContext->PSSetSamplers(0, 1, prevSampler.GetAddressOf());
+    mContext->PSSetConstantBuffers(0, 1, prevCB.GetAddressOf());
+
+    mLastShaderProgram = nullptr;
+    mLastVertexBufferStride = 0;
+    mLastBlendState.Reset();
+    for (int i = 0; i < SHADER_MAX_TEXTURES; i++) {
+        mLastResourceViews[i].Reset();
+        mLastSamplerStates[i].Reset();
+    }
+    mLastPrimitaveTopology = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+
+    return reinterpret_cast<uintptr_t>(GetFramebufferTextureId(mPostOutputFb));
+}
+
+static D3D11_TEXTURE_ADDRESS_MODE GdxPipelineWrapModeD3D11(GdxPostPassDesc::WrapMode mode) {
+    switch (mode) {
+        case GdxPostPassDesc::WrapMode::ClampToBorder:
+            return D3D11_TEXTURE_ADDRESS_BORDER;
+        case GdxPostPassDesc::WrapMode::Repeat:
+            return D3D11_TEXTURE_ADDRESS_WRAP;
+        case GdxPostPassDesc::WrapMode::MirroredRepeat:
+            return D3D11_TEXTURE_ADDRESS_MIRROR;
+        case GdxPostPassDesc::WrapMode::ClampToEdge:
+        default:
+            return D3D11_TEXTURE_ADDRESS_CLAMP;
+    }
+}
+
+static D3D11_FILTER GdxPipelineFilterD3D11(bool linear) {
+    return linear ? D3D11_FILTER_MIN_MAG_MIP_LINEAR : D3D11_FILTER_MIN_MAG_MIP_POINT;
+}
+
+static std::filesystem::path GdxResolvePipelineShaderPathD3D11(const std::filesystem::path& presetDir,
+                                                               const std::string& stem) {
+    // lexically_normal: pack presets carry ".." chains that can push the joined
+    // path past MAX_PATH even when the real target is short.
+    std::filesystem::path slangPath = (presetDir / (stem + ".slang")).lexically_normal();
+    if (std::filesystem::exists(slangPath)) {
+        return slangPath;
+    }
+    return (presetDir / (stem + ".hlsl")).lexically_normal();
+}
+
+bool GdxCompilePipelinePassD3D11(GfxRenderingAPIDX11* self, const std::filesystem::path& path,
+                                        GfxRenderingAPIDX11::PostShaderProgramD3D11* outProgram, bool filterLinear,
+                                        GdxPostPassDesc::WrapMode wrapS, GdxPostPassDesc::WrapMode wrapT) {
+    outProgram->isSlang = false;
+    outProgram->slangParameters.clear();
+    outProgram->slangCbSize = 0;
+    outProgram->slangUsedBuiltins = {};
+
+    const bool isSlang = path.extension() == ".slang";
+    if (isSlang) {
+        // glslang/SPIRV-Cross throw on pathological inputs (Mega_Bezel-scale chains);
+        // a failed pass must fall back to the unfiltered image, never crash the game.
+        GdxSlangTranslation trans;
+        try {
+            trans = GdxTranslateSlangFile(path, GdxSlangTarget::HlslSm50);
+        } catch (const std::exception& e) {
+            SPDLOG_ERROR("Slang translation threw for {}: {}", path.string(), e.what());
+            return false;
+        } catch (...) {
+            SPDLOG_ERROR("Slang translation threw for {}", path.string());
+            return false;
+        }
+        GdxDumpSlangTranslation(path, GdxSlangTarget::HlslSm50, trans.source);
+        if (trans.hasVertexStage) {
+            GdxDumpSlangTranslation(path.parent_path() / (path.stem().string() + "-vs.slang"),
+                                    GdxSlangTarget::HlslSm50, trans.vertexSource);
+        }
+        if (!trans.ok) {
+            SPDLOG_ERROR("Slang translation failed for {}: {}", path.string(), trans.error);
+            return false;
+        }
+        outProgram->isSlang = true;
+        outProgram->slangParameters = trans.parameters;
+        outProgram->slangCbSize =
+            GdxSlangHlslCBufferLayout::TotalSize(trans.parameters, trans.usedBuiltins.extraSizeNames.size());
+        outProgram->slangUsedBuiltins = trans.usedBuiltins;
+        // A translated vertex stage keeps the fullscreen-triangle draw (its
+        // Position/TexCoord inputs are synthesized from SV_VertexID).
+        const char* vsSource = trans.hasVertexStage ? trans.vertexSource.c_str() : sGdxPostVsSource;
+        return GdxCompilePostShaderD3D11(self, vsSource, trans.source.c_str(), outProgram, true,
+                                         GdxPipelineFilterD3D11(filterLinear), GdxPipelineWrapModeD3D11(wrapS),
+                                         GdxPipelineWrapModeD3D11(wrapT), outProgram->slangCbSize, "ps_5_0");
+    }
+
+    std::string customSource = GdxReadShaderFile(path);
+    if (customSource.empty()) {
+        SPDLOG_ERROR("Pipeline pass shader is empty or could not be read: {}", path.string());
+        return false;
+    }
+    std::string fullSource = std::string(sGdxPostCustomPrelude) + customSource;
+    return GdxCompilePostShaderD3D11(self, sGdxPostVsSource, fullSource.c_str(), outProgram, true,
+                                     GdxPipelineFilterD3D11(filterLinear), GdxPipelineWrapModeD3D11(wrapS),
+                                     GdxPipelineWrapModeD3D11(wrapT));
+}
+
+
+// Builds every pass of a post pipeline off the render thread: file reads, slang translation and
+// D3DCompile are all free-threaded. Only device object creation (install) needs the main thread.
+static void GdxBuildPostPipelineWorkerD3D11(pD3DCompile compileFn, std::shared_ptr<GdxPostPipelineBuildD3D11> build,
+                                            GdxPostShaderPipeline pipeline) {
+    const std::filesystem::path presetDir = pipeline.presetPath.parent_path();
+    build->passes.resize(pipeline.passes.size());
+    for (size_t i = 0; i < pipeline.passes.size(); ++i) {
+        if (build->cancel.load()) {
+            return;
+        }
+        GdxPostPassBuildD3D11& pass = build->passes[i];
+        const std::filesystem::path shaderPath = GdxResolvePipelineShaderPathD3D11(presetDir, pipeline.passes[i].shader);
+        pass.cacheKey = shaderPath.string();
+        try {
+            pass.mtime = static_cast<uint64_t>(std::filesystem::last_write_time(shaderPath).time_since_epoch().count());
+        } catch (...) {
+            SPDLOG_ERROR("Pipeline pass shader not found: {}", shaderPath.string());
+            build->state = 2;
+            return;
+        }
+        pass.samplerFilter = GdxPipelineFilterD3D11(pipeline.passes[i].filterLinear);
+        pass.wrapU = GdxPipelineWrapModeD3D11(pipeline.passes[i].wrapS);
+        pass.wrapV = GdxPipelineWrapModeD3D11(pipeline.passes[i].wrapT);
+
+        const char* vsSource = sGdxPostVsSource;
+        std::string vsStorage;
+        std::string psStorage;
+        const char* pixelShaderProfile = "ps_4_0";
+        if (shaderPath.extension() == ".slang") {
+            GdxSlangTranslation trans;
+            try {
+                trans = GdxTranslateSlangFile(shaderPath, GdxSlangTarget::HlslSm50);
+            } catch (const std::exception& e) {
+                SPDLOG_ERROR("Slang translation threw for {}: {}", shaderPath.string(), e.what());
+                build->state = 2;
+                return;
+            } catch (...) {
+                SPDLOG_ERROR("Slang translation threw for {}", shaderPath.string());
+                build->state = 2;
+                return;
+            }
+            GdxDumpSlangTranslation(shaderPath, GdxSlangTarget::HlslSm50, trans.source);
+            if (trans.hasVertexStage) {
+                GdxDumpSlangTranslation(shaderPath.parent_path() / (shaderPath.stem().string() + "-vs.slang"),
+                                        GdxSlangTarget::HlslSm50, trans.vertexSource);
+            }
+            if (!trans.ok) {
+                SPDLOG_ERROR("Slang translation failed for {}: {}", shaderPath.string(), trans.error);
+                build->state = 2;
+                return;
+            }
+            pass.isSlang = true;
+            pass.slangParameters = trans.parameters;
+            pass.slangCbSize =
+                GdxSlangHlslCBufferLayout::TotalSize(trans.parameters, trans.usedBuiltins.extraSizeNames.size());
+            pass.slangUsedBuiltins = trans.usedBuiltins;
+            if (trans.hasVertexStage) {
+                vsStorage = std::move(trans.vertexSource);
+                vsSource = vsStorage.c_str();
+            }
+            psStorage = std::move(trans.source);
+            pixelShaderProfile = "ps_5_0";
+        } else {
+            std::string customSource = GdxReadShaderFile(shaderPath);
+            if (customSource.empty()) {
+                SPDLOG_ERROR("Pipeline pass shader is empty or could not be read: {}", shaderPath.string());
+                build->state = 2;
+                return;
+            }
+            psStorage = std::string(sGdxPostCustomPrelude) + customSource;
+        }
+        if (build->cancel.load()) {
+            return;
+        }
+        if (!GdxCompilePostShaderBlobsD3D11(compileFn, vsSource, psStorage.c_str(), pixelShaderProfile,
+                                            pass.vsBlob.GetAddressOf(), pass.psBlob.GetAddressOf())) {
+            build->state = 2;
+            return;
+        }
+        pass.ok = true;
+    }
+    build->state = 1;
+}
+
+// Main-thread half of the async pipeline build: turns compiled bytecode into D3D11 device objects.
+static bool GdxInstallPostPipelineBuildD3D11(GfxRenderingAPIDX11* self, GdxPostPipelineBuildD3D11* build) {
+    for (GdxPostPassBuildD3D11& pass : build->passes) {
+        GfxRenderingAPIDX11::PostShaderProgramD3D11 prg = {};
+        prg.attempted = true;
+        prg.mtime = pass.mtime;
+        prg.isSlang = pass.isSlang;
+        prg.slangParameters = std::move(pass.slangParameters);
+        prg.slangCbSize = pass.slangCbSize;
+        prg.slangUsedBuiltins = std::move(pass.slangUsedBuiltins);
+        if (!GdxCreatePostProgramObjectsD3D11(self, pass.vsBlob.Get(), pass.psBlob.Get(), &prg, true,
+                                              pass.samplerFilter, pass.wrapU, pass.wrapV,
+                                              pass.isSlang ? pass.slangCbSize : 16)) {
+            self->mPostPipelineProgramCache[pass.cacheKey] = std::move(prg);
+            return false;
+        }
+        self->mPostPipelineProgramCache[pass.cacheKey] = std::move(prg);
+    }
+    return true;
+}
+
+GdxSlangUsedBuiltins GdxUnionUsedBuiltins(const std::vector<GfxRenderingAPIDX11::PostShaderProgramD3D11*>& programs) {
+    GdxSlangUsedBuiltins result;
+    for (const GfxRenderingAPIDX11::PostShaderProgramD3D11* prg : programs) {
+        result.maxOriginalHistory = std::max(result.maxOriginalHistory, prg->slangUsedBuiltins.maxOriginalHistory);
+        result.passOutputIndices.insert(prg->slangUsedBuiltins.passOutputIndices.begin(),
+                                        prg->slangUsedBuiltins.passOutputIndices.end());
+        result.passFeedbackIndices.insert(prg->slangUsedBuiltins.passFeedbackIndices.begin(),
+                                          prg->slangUsedBuiltins.passFeedbackIndices.end());
+        result.userTextureIndices.insert(prg->slangUsedBuiltins.userTextureIndices.begin(),
+                                         prg->slangUsedBuiltins.userTextureIndices.end());
+    }
+    return result;
+}
+
+static DXGI_FORMAT GdxPipelineFramebufferFormatDxgi(const GdxPostPassDesc& pass) {
+    if (pass.floatFramebuffer) {
+        return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    }
+    if (pass.srgbFramebuffer) {
+        return DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    }
+    return DXGI_FORMAT_R8G8B8A8_UNORM;
+}
+
+static GdxFramebufferFormat GdxPipelineFramebufferFormat(const GdxPostPassDesc& pass) {
+    if (pass.floatFramebuffer) {
+        return GdxFramebufferFormat::R16G16B16A16_FLOAT;
+    }
+    if (pass.srgbFramebuffer) {
+        return GdxFramebufferFormat::R8G8B8A8_UNORM_SRGB;
+    }
+    return GdxFramebufferFormat::R8G8B8A8_UNORM;
+}
+
+bool GdxLoadPipelineLutsD3D11(GfxRenderingAPIDX11* self, const GdxPostShaderPipeline& pipeline,
+                                     std::vector<GfxRenderingAPIDX11::PostPipelineLutD3D11>* outLuts,
+                                     std::vector<std::filesystem::path>* outPaths) {
+    const std::filesystem::path presetDir = pipeline.presetPath.parent_path();
+
+    outLuts->clear();
+    outPaths->clear();
+    outLuts->reserve(pipeline.textureOrder.size());
+    outPaths->reserve(pipeline.textureOrder.size());
+
+    for (const std::string& name : pipeline.textureOrder) {
+        GfxRenderingAPIDX11::PostPipelineLutD3D11 lut;
+        auto it = pipeline.textures.find(name);
+        if (it == pipeline.textures.end()) {
+            outLuts->push_back(std::move(lut));
+            outPaths->push_back(std::filesystem::path());
+            continue;
+        }
+
+        std::filesystem::path imagePath = (presetDir / it->second.path).lexically_normal();
+        outPaths->push_back(imagePath);
+
+        int w = 0, h = 0, channels = 0;
+        stbi_uc* pixels = stbi_load(imagePath.string().c_str(), &w, &h, &channels, 4);
+        if (pixels == nullptr) {
+            SPDLOG_WARN("Could not load LUT texture '{}': {}", imagePath.string(), stbi_failure_reason());
+            outLuts->push_back(std::move(lut));
+            continue;
+        }
+        lut.width = static_cast<uint32_t>(w);
+        lut.height = static_cast<uint32_t>(h);
+
+        D3D11_TEXTURE2D_DESC textureDesc;
+        ZeroMemory(&textureDesc, sizeof(textureDesc));
+        textureDesc.Width = static_cast<UINT>(w);
+        textureDesc.Height = static_cast<UINT>(h);
+        textureDesc.MipLevels = 1;
+        textureDesc.ArraySize = 1;
+        textureDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        textureDesc.SampleDesc.Count = 1;
+        textureDesc.SampleDesc.Quality = 0;
+        textureDesc.Usage = D3D11_USAGE_IMMUTABLE;
+        textureDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        textureDesc.CPUAccessFlags = 0;
+        textureDesc.MiscFlags = 0;
+
+        D3D11_SUBRESOURCE_DATA resourceData;
+        resourceData.pSysMem = pixels;
+        resourceData.SysMemPitch = static_cast<UINT>(w * 4);
+        resourceData.SysMemSlicePitch = resourceData.SysMemPitch * static_cast<UINT>(h);
+
+        if (FAILED(self->mDevice->CreateTexture2D(&textureDesc, &resourceData, lut.texture.GetAddressOf()))) {
+            SPDLOG_WARN("Failed to create LUT texture '{}'", imagePath.string());
+            stbi_image_free(pixels);
+            outLuts->push_back(std::move(lut));
+            continue;
+        }
+
+        if (FAILED(self->mDevice->CreateShaderResourceView(lut.texture.Get(), nullptr, lut.srv.GetAddressOf()))) {
+            SPDLOG_WARN("Failed to create LUT SRV '{}'", imagePath.string());
+            stbi_image_free(pixels);
+            outLuts->push_back(std::move(lut));
+            continue;
+        }
+
+        D3D11_SAMPLER_DESC samplerDesc;
+        ZeroMemory(&samplerDesc, sizeof(samplerDesc));
+        samplerDesc.Filter = it->second.linear ? D3D11_FILTER_MIN_MAG_MIP_LINEAR : D3D11_FILTER_MIN_MAG_MIP_POINT;
+        samplerDesc.AddressU = GdxPipelineWrapModeD3D11(it->second.wrap);
+        samplerDesc.AddressV = GdxPipelineWrapModeD3D11(it->second.wrap);
+        samplerDesc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+        samplerDesc.MinLOD = -D3D11_FLOAT32_MAX;
+        samplerDesc.MaxLOD = D3D11_FLOAT32_MAX;
+        if (FAILED(self->mDevice->CreateSamplerState(&samplerDesc, lut.sampler.GetAddressOf()))) {
+            SPDLOG_WARN("Failed to create LUT sampler '{}'", imagePath.string());
+        }
+
+        stbi_image_free(pixels);
+        outLuts->push_back(std::move(lut));
+    }
+    return true;
+}
+
+// `<Alias>` / `<Alias>Feedback` named samplers and `<Alias>Size` uniforms refer
+// to passes by their `aliasN =` key; resolve the name to a pass index.
+static int GdxFindPipelinePassByAlias(const GdxPostShaderPipeline& pipeline, const std::string& alias) {
+    for (size_t i = 0; i < pipeline.passes.size(); ++i) {
+        if (!pipeline.passes[i].alias.empty() && pipeline.passes[i].alias == alias) {
+            return static_cast<int>(i);
+        }
+    }
+    return -1;
+}
+
+uintptr_t GfxRenderingAPIDX11::ApplyPostShaderChain(int srcFbId, const GdxPostShaderPipeline& pipeline,
+                                                    uint32_t nativeW, uint32_t nativeH, uint32_t outW, uint32_t outH) {
+    if (srcFbId <= 0 || srcFbId >= (int)mFrameBuffers.size() || nativeW == 0 || nativeH == 0 || outW == 0 ||
+        outH == 0 || pipeline.passes.empty()) {
+        return 0;
+    }
+
+    const std::filesystem::path presetDir = pipeline.presetPath.parent_path();
+
+    // Async pipeline build: the preset key includes the folded pass mtimes, so any disk edit
+    // retriggers a rebuild. While a build runs we publish the unfiltered frame; a failed build is
+    // latched so it is not retried every frame.
+    const std::string chainKey = pipeline.presetPath.generic_string() + "#" + std::to_string(pipeline.mtime);
+    if (chainKey != mPostPipelineReadyKey) {
+        if (chainKey == mPostPipelineFailedKey) {
+            return 0;
+        }
+        if (mPostPipelineBuild != nullptr && mPostPipelineBuild->key == chainKey) {
+            const int state = mPostPipelineBuild->state.load();
+            if (state == 0) {
+                return 0;
+            }
+            if (state == 2 || !GdxInstallPostPipelineBuildD3D11(this, mPostPipelineBuild.get())) {
+                mPostPipelineFailedKey = chainKey;
+                mPostPipelineBuild.reset();
+                return 0;
+            }
+            mPostPipelineBuild.reset();
+            mPostPipelineReadyKey = chainKey;
+        } else {
+            bool allCached = true;
+            for (size_t i = 0; i < pipeline.passes.size(); ++i) {
+                const std::filesystem::path sp = GdxResolvePipelineShaderPathD3D11(presetDir, pipeline.passes[i].shader);
+                uint64_t mt = 0;
+                try {
+                    mt = static_cast<uint64_t>(std::filesystem::last_write_time(sp).time_since_epoch().count());
+                } catch (...) {
+                    allCached = false;
+                    break;
+                }
+                auto it = mPostPipelineProgramCache.find(sp.string());
+                if (it == mPostPipelineProgramCache.end() || it->second.mtime != mt ||
+                    it->second.vertex_shader.Get() == nullptr) {
+                    allCached = false;
+                    break;
+                }
+            }
+            if (allCached) {
+                mPostPipelineReadyKey = chainKey;
+                mPostPipelineFailedKey.clear();
+            } else {
+                if (mPostPipelineBuild != nullptr) {
+                    mPostPipelineBuild->cancel = true;
+                }
+                auto build = std::make_shared<GdxPostPipelineBuildD3D11>();
+                build->key = chainKey;
+                std::thread(GdxBuildPostPipelineWorkerD3D11, mD3dCompile, build, pipeline).detach();
+                mPostPipelineBuild = std::move(build);
+                return 0;
+            }
+        }
+    }
+
+    // Compile (or retrieve cached) programs for every pass. The cache key is the full shader path
+    // so the same pass file reused across presets still reloads correctly when its mtime changes.
+    std::vector<PostShaderProgramD3D11*> programs;
+    programs.reserve(pipeline.passes.size());
+    for (size_t i = 0; i < pipeline.passes.size(); ++i) {
+        const std::string& shaderStem = pipeline.passes[i].shader;
+        const std::filesystem::path shaderPath = GdxResolvePipelineShaderPathD3D11(presetDir, shaderStem);
+        const std::string cacheKey = shaderPath.string();
+
+        uint64_t mtimeTicks = 0;
+        try {
+            mtimeTicks = static_cast<uint64_t>(std::filesystem::last_write_time(shaderPath).time_since_epoch().count());
+        } catch (...) {
+            SPDLOG_ERROR("Pipeline pass shader not found: {}", shaderPath.string());
+            return 0;
+        }
+
+        auto it = mPostPipelineProgramCache.find(cacheKey);
+        if (it == mPostPipelineProgramCache.end() || it->second.mtime != mtimeTicks) {
+            PostShaderProgramD3D11 prg = {};
+            prg.attempted = true;
+            prg.mtime = mtimeTicks;
+            if (!GdxCompilePipelinePassD3D11(this, shaderPath, &prg, pipeline.passes[i].filterLinear,
+                                             pipeline.passes[i].wrapS, pipeline.passes[i].wrapT)) {
+                SPDLOG_ERROR("Pipeline pass shader compile failed: {}", shaderPath.string());
+                mPostPipelineProgramCache[cacheKey] = std::move(prg);
+                return 0;
+            }
+            mPostPipelineProgramCache[cacheKey] = std::move(prg);
+            it = mPostPipelineProgramCache.find(cacheKey);
+        }
+        if (it->second.vertex_shader.Get() == nullptr) {
+            return 0;
+        }
+        programs.push_back(&it->second);
+    }
+
+    const GdxSlangUsedBuiltins used = GdxUnionUsedBuiltins(programs);
+    const size_t historySize = used.maxOriginalHistory >= 0 ? static_cast<size_t>(used.maxOriginalHistory + 1) : 0;
+
+    // Allocate N+1 framebuffers: [0] is the first-pass input (native size), [1..N-1] are
+    // intermediate pass outputs, and [N] is the final pass output.
+    const size_t neededFbs = pipeline.passes.size() + 1;
+    while (mPostPipelineFbs.size() < neededFbs) {
+        mPostPipelineFbs.push_back(CreateFramebuffer());
+    }
+
+    // Allocate history ring buffers if any pass references OriginalHistoryN.
+    while (mPostPipelineHistoryFbs.size() < historySize) {
+        mPostPipelineHistoryFbs.push_back(CreateFramebuffer());
+    }
+
+    // Allocate one feedback framebuffer per pass that feeds back. The preset's
+    // feedback_pass flag is one source; a pass is also fed back when any shader
+    // samples PassFeedbackN or an `<Alias>Feedback` named sampler (Mega_Bezel
+    // uses the latter without ever setting the flag).
+    if (mPostPipelineFeedbackFbs.size() < pipeline.passes.size()) {
+        mPostPipelineFeedbackFbs.resize(pipeline.passes.size(), -1);
+    }
+    std::set<int> feedbackNeeded;
+    for (size_t i = 0; i < pipeline.passes.size(); ++i) {
+        if (pipeline.passes[i].feedbackPass) {
+            feedbackNeeded.insert(static_cast<int>(i));
+        }
+    }
+    for (const PostShaderProgramD3D11* prg : programs) {
+        feedbackNeeded.insert(prg->slangUsedBuiltins.passFeedbackIndices.begin(),
+                              prg->slangUsedBuiltins.passFeedbackIndices.end());
+        for (const std::string& samplerName : prg->slangUsedBuiltins.namedSamplers) {
+            if (samplerName.size() > 8 && samplerName.compare(samplerName.size() - 8, 8, "Feedback") == 0) {
+                const int passIdx =
+                    GdxFindPipelinePassByAlias(pipeline, samplerName.substr(0, samplerName.size() - 8));
+                if (passIdx >= 0) {
+                    feedbackNeeded.insert(passIdx);
+                }
+            }
+        }
+    }
+    for (int i : feedbackNeeded) {
+        if (i >= 0 && i < (int)pipeline.passes.size() && mPostPipelineFeedbackFbs[i] < 0) {
+            mPostPipelineFeedbackFbs[i] = CreateFramebuffer();
+        }
+    }
+
+    // Load LUT textures if the pipeline's LUT set changed. A change in order or
+    // path triggers a reload; everything else reuses the existing GPU textures.
+    bool lutsChanged = mPostPipelineLuts.size() != pipeline.textureOrder.size();
+    if (!lutsChanged) {
+        for (size_t i = 0; i < pipeline.textureOrder.size(); ++i) {
+            auto it = pipeline.textures.find(pipeline.textureOrder[i]);
+            std::filesystem::path expectedPath;
+            if (it != pipeline.textures.end()) {
+                expectedPath = presetDir / it->second.path;
+            }
+            if (mPostPipelineLutPaths[i] != expectedPath) {
+                lutsChanged = true;
+                break;
+            }
+        }
+    }
+    if (lutsChanged) {
+        mPostPipelineLuts.clear();
+        GdxLoadPipelineLutsD3D11(this, pipeline, &mPostPipelineLuts, &mPostPipelineLutPaths);
+    }
+
+    // Shared clamp sampler for history/feedback/pass-output lookups.
+    if (mPostPipelineClampSampler.Get() == nullptr) {
+        D3D11_SAMPLER_DESC clampDesc;
+        ZeroMemory(&clampDesc, sizeof(clampDesc));
+        clampDesc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+        clampDesc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+        clampDesc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+        clampDesc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+        clampDesc.MinLOD = -D3D11_FLOAT32_MAX;
+        clampDesc.MaxLOD = D3D11_FLOAT32_MAX;
+        if (FAILED(mDevice->CreateSamplerState(&clampDesc, mPostPipelineClampSampler.GetAddressOf()))) {
+            SPDLOG_ERROR("Failed to create pipeline clamp sampler");
+            return 0;
+        }
+    }
+
+    // Compile the copy shader used to downsample the source framebuffer to native resolution.
+    if (!mPostCopyProgram.attempted) {
+        mPostCopyProgram.attempted = true;
+        if (!GdxCompilePostCopyShaderD3D11(this, &mPostCopyProgram)) {
+            SPDLOG_ERROR("Post copy shader compile failed");
+            return 0;
+        }
+    }
+    if (mPostCopyProgram.vertex_shader.Get() == nullptr) {
+        return 0;
+    }
+
+    // Save device state so the interpreter's cached D3D11 state stays consistent with the context.
+    ComPtr<ID3D11RenderTargetView> prevRTV;
+    ComPtr<ID3D11DepthStencilView> prevDSV;
+    mContext->OMGetRenderTargets(1, prevRTV.GetAddressOf(), prevDSV.GetAddressOf());
+
+    D3D11_VIEWPORT prevViewport;
+    UINT numViewports = 1;
+    mContext->RSGetViewports(&numViewports, &prevViewport);
+
+    ComPtr<ID3D11VertexShader> prevVS;
+    ComPtr<ID3D11PixelShader> prevPS;
+    ComPtr<ID3D11GeometryShader> prevGS;
+    mContext->VSGetShader(prevVS.GetAddressOf(), nullptr, nullptr);
+    mContext->PSGetShader(prevPS.GetAddressOf(), nullptr, nullptr);
+    mContext->GSGetShader(prevGS.GetAddressOf(), nullptr, nullptr);
+
+    ComPtr<ID3D11InputLayout> prevIL;
+    mContext->IAGetInputLayout(prevIL.GetAddressOf());
+
+    ComPtr<ID3D11Buffer> prevVB;
+    UINT prevStride = 0, prevOffset = 0;
+    mContext->IAGetVertexBuffers(0, 1, prevVB.GetAddressOf(), &prevStride, &prevOffset);
+
+    D3D_PRIMITIVE_TOPOLOGY prevTopology;
+    mContext->IAGetPrimitiveTopology(&prevTopology);
+
+    ComPtr<ID3D11BlendState> prevBlend;
+    float prevBlendFactor[4] = {};
+    UINT prevSampleMask = 0xFFFFFFFF;
+    mContext->OMGetBlendState(prevBlend.GetAddressOf(), prevBlendFactor, &prevSampleMask);
+
+    ComPtr<ID3D11DepthStencilState> prevDepthStencil;
+    UINT prevStencilRef = 0;
+    mContext->OMGetDepthStencilState(prevDepthStencil.GetAddressOf(), &prevStencilRef);
+
+    ComPtr<ID3D11RasterizerState> prevRasterizer;
+    mContext->RSGetState(prevRasterizer.GetAddressOf());
+
+    ComPtr<ID3D11ShaderResourceView> prevSRV;
+    mContext->PSGetShaderResources(0, 1, prevSRV.GetAddressOf());
+
+    ComPtr<ID3D11SamplerState> prevSampler;
+    mContext->PSGetSamplers(0, 1, prevSampler.GetAddressOf());
+
+    ComPtr<ID3D11Buffer> prevCB;
+    mContext->PSGetConstantBuffers(0, 1, prevCB.GetAddressOf());
+
+    // Step 1: linear downsample of the rendered frame to native resolution into the first input.
+    UpdateFramebufferParameters(mPostPipelineFbs[0], nativeW, nativeH, 1, true, true, false, false);
+    {
+        FramebufferDX11& dstFb = mFrameBuffers[mPostPipelineFbs[0]];
+        TextureData& srcTex = mTextures[mFrameBuffers[srcFbId].texture_id];
+        mContext->OMSetRenderTargets(1, dstFb.render_target_view.GetAddressOf(), nullptr);
+
+        D3D11_VIEWPORT viewport;
+        viewport.TopLeftX = 0.0f;
+        viewport.TopLeftY = 0.0f;
+        viewport.Width = static_cast<float>(nativeW);
+        viewport.Height = static_cast<float>(nativeH);
+        viewport.MinDepth = 0.0f;
+        viewport.MaxDepth = 1.0f;
+        mContext->RSSetViewports(1, &viewport);
+
+        mContext->IASetInputLayout(mPostCopyProgram.input_layout.Get());
+        mContext->VSSetShader(mPostCopyProgram.vertex_shader.Get(), nullptr, 0);
+        mContext->PSSetShader(mPostCopyProgram.pixel_shader.Get(), nullptr, 0);
+        mContext->PSSetShaderResources(0, 1, srcTex.resource_view.GetAddressOf());
+        mContext->PSSetSamplers(0, 1, mPostCopyProgram.sampler_state.GetAddressOf());
+        mContext->PSSetConstantBuffers(0, 0, nullptr);
+        mContext->OMSetBlendState(mPostCopyProgram.blend_state.Get(), nullptr, 0xFFFFFFFF);
+        mContext->OMSetDepthStencilState(nullptr, 0);
+        mContext->RSSetState(mPostCopyProgram.rasterizer_state.Get());
+        mContext->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        mContext->Draw(3, 0);
+    }
+
+    // Snapshot the current source frame into the history ring before the passes run.
+    if (historySize > 0) {
+        const int historyFb = mPostPipelineHistoryFbs[mPostPipelineHistoryIndex % historySize];
+        UpdateFramebufferParameters(historyFb, nativeW, nativeH, 1, true, true, false, false);
+        TextureData& srcTex = mTextures[mFrameBuffers[mPostPipelineFbs[0]].texture_id];
+        TextureData& dstTex = mTextures[mFrameBuffers[historyFb].texture_id];
+        mContext->CopyResource(dstTex.texture.Get(), srcTex.texture.Get());
+        ++mPostPipelineHistoryIndex;
+    }
+
+    // Resolve effective parameter values (CVar overrides .slangp override overrides default).
+    // The menu sliders write Float CVars, so this must read Float — CVarGetString would
+    // return "" for them and the override would never apply.
+    const std::string presetStem = GdxPostShaderCvarStem(
+        std::filesystem::path(Ship::Context::GetAppDirectoryPath()) / "shaders", pipeline.presetPath);
+    std::unordered_map<std::string, float> parameterOverrides = pipeline.parameterOverrides;
+    for (const PostShaderProgramD3D11* prg : programs) {
+        for (const GdxSlangParameter& p : prg->slangParameters) {
+            const std::string cvarName = "gEnhancements.Graphics.PipelineParam." + presetStem + "." + p.name;
+            if (CVarGet(cvarName.c_str()) != nullptr) {
+                parameterOverrides[p.name] = CVarGetFloat(cvarName.c_str(), p.defaultValue);
+            }
+        }
+    }
+
+    // Step 2: run each pass through the chain. Every pass reads from the previous output and writes
+    // to its own output framebuffer; the last pass targets the final output size.
+    // Output sizes are deterministic from the scale chain, so precompute them all:
+    // PassOutputNSize / `<Alias>Size` can reference a pass that runs later.
+    std::vector<std::pair<uint32_t, uint32_t>> passOutSizes(pipeline.passes.size());
+    {
+        uint32_t chainW = nativeW, chainH = nativeH;
+        for (size_t i = 0; i < pipeline.passes.size(); ++i) {
+            const GdxPostPassDesc& pass = pipeline.passes[i];
+            const bool isLast = (i + 1 == pipeline.passes.size());
+            const uint32_t dw = isLast ? outW : GdxResolvePostPassScale(pass.scaleTypeX, pass.scaleX, chainW, outW);
+            const uint32_t dh = isLast ? outH : GdxResolvePostPassScale(pass.scaleTypeY, pass.scaleY, chainH, outH);
+            passOutSizes[i] = { dw, dh };
+            chainW = dw;
+            chainH = dh;
+        }
+    }
+
+    uint32_t srcW = nativeW;
+    uint32_t srcH = nativeH;
+    int srcFb = mPostPipelineFbs[0];
+
+    for (size_t i = 0; i < pipeline.passes.size(); ++i) {
+        const GdxPostPassDesc& pass = pipeline.passes[i];
+        const uint32_t dstW = passOutSizes[i].first;
+        const uint32_t dstH = passOutSizes[i].second;
+        const int dstFb = (int)mPostPipelineFbs[i + 1];
+
+        const bool shouldSkip = pass.frameCountMod != 0 && (mFrameCount % pass.frameCountMod) != 0;
+
+        if (!shouldSkip) {
+            UpdateFramebufferParameters(dstFb, dstW, dstH, 1, true, true, false, false,
+                                        GdxPipelineFramebufferFormat(pass));
+        }
+
+        if (!shouldSkip) {
+            FramebufferDX11& srcFbData = mFrameBuffers[srcFb];
+            FramebufferDX11& dstFbData = mFrameBuffers[dstFb];
+            TextureData& srcTex = mTextures[srcFbData.texture_id];
+            PostShaderProgramD3D11* prg = programs[i];
+
+            // Retarget output before binding SRVs: the source framebuffer's RTV is still bound
+            // from the previous pass, and D3D11 forces a conflicting SRV to NULL.
+            mContext->OMSetRenderTargets(1, dstFbData.render_target_view.GetAddressOf(), nullptr);
+
+            // Bind primary source at slot 0.
+            mContext->PSSetShaderResources(0, 1, srcTex.resource_view.GetAddressOf());
+            mContext->PSSetSamplers(0, 1, prg->sampler_state.GetAddressOf());
+
+            ID3D11ShaderResourceView* nullSrv = nullptr;
+            ID3D11SamplerState* nullSampler = nullptr;
+
+            // OriginalHistoryN: previous N source frames, oldest first.
+            for (int n = 0; n <= prg->slangUsedBuiltins.maxOriginalHistory; ++n) {
+                const size_t idx = (mPostPipelineHistoryIndex - 1 - n + historySize) % historySize;
+                const int histFb = mPostPipelineHistoryFbs[idx];
+                TextureData& histTex = mTextures[mFrameBuffers[histFb].texture_id];
+                const int slot = GdxSlangTextureBindings::OriginalHistory(n);
+                mContext->PSSetShaderResources(slot, 1, histTex.resource_view.GetAddressOf());
+                mContext->PSSetSamplers(slot, 1, mPostPipelineClampSampler.GetAddressOf());
+            }
+
+            // PassOutputN: same-frame output of pass N.
+            for (int n : prg->slangUsedBuiltins.passOutputIndices) {
+                if (n >= 0 && n < (int)mPostPipelineFbs.size() - 1) {
+                    const int outFb = mPostPipelineFbs[n + 1];
+                    TextureData& outTex = mTextures[mFrameBuffers[outFb].texture_id];
+                    const int slot = GdxSlangTextureBindings::PassOutput(n);
+                    mContext->PSSetShaderResources(slot, 1, outTex.resource_view.GetAddressOf());
+                    mContext->PSSetSamplers(slot, 1, mPostPipelineClampSampler.GetAddressOf());
+                }
+            }
+
+            // PassFeedbackN: previous frame's output of pass N.
+            for (int n : prg->slangUsedBuiltins.passFeedbackIndices) {
+                if (n >= 0 && n < (int)mPostPipelineFeedbackFbs.size() && mPostPipelineFeedbackFbs[n] >= 0) {
+                    const int fbFb = mPostPipelineFeedbackFbs[n];
+                    TextureData& fbTex = mTextures[mFrameBuffers[fbFb].texture_id];
+                    const int slot = GdxSlangTextureBindings::PassFeedback(n);
+                    mContext->PSSetShaderResources(slot, 1, fbTex.resource_view.GetAddressOf());
+                    mContext->PSSetSamplers(slot, 1, mPostPipelineClampSampler.GetAddressOf());
+                }
+            }
+
+            // UserN: LUT textures declared in the preset.
+            for (int n : prg->slangUsedBuiltins.userTextureIndices) {
+                if (n >= 0 && n < (int)mPostPipelineLuts.size()) {
+                    const PostPipelineLutD3D11& lut = mPostPipelineLuts[n];
+                    const int slot = GdxSlangTextureBindings::User(n);
+                    if (lut.srv.Get() != nullptr) {
+                        mContext->PSSetShaderResources(slot, 1, lut.srv.GetAddressOf());
+                    } else {
+                        mContext->PSSetShaderResources(slot, 1, &nullSrv);
+                    }
+                    if (lut.sampler.Get() != nullptr) {
+                        mContext->PSSetSamplers(slot, 1, lut.sampler.GetAddressOf());
+                    } else {
+                        mContext->PSSetSamplers(slot, 1, &nullSampler);
+                    }
+                }
+            }
+
+            // Named samplers: a preset LUT when the name is a `textures` entry,
+            // `<Alias>` for that pass's current-frame output, `<Alias>Feedback`
+            // for its previous frame.
+            for (size_t k = 0; k < prg->slangUsedBuiltins.namedSamplers.size(); ++k) {
+                const std::string& samplerName = prg->slangUsedBuiltins.namedSamplers[k];
+                const int slot = GdxSlangTextureBindings::Named(static_cast<int>(k));
+                ID3D11ShaderResourceView* namedSrv = nullptr;
+                ID3D11SamplerState* namedSampler = mPostPipelineClampSampler.Get();
+                if (pipeline.textures.find(samplerName) != pipeline.textures.end()) {
+                    const auto orderIt =
+                        std::find(pipeline.textureOrder.begin(), pipeline.textureOrder.end(), samplerName);
+                    const size_t lutIdx = static_cast<size_t>(orderIt - pipeline.textureOrder.begin());
+                    if (orderIt != pipeline.textureOrder.end() && lutIdx < mPostPipelineLuts.size()) {
+                        namedSrv = mPostPipelineLuts[lutIdx].srv.Get();
+                        if (mPostPipelineLuts[lutIdx].sampler.Get() != nullptr) {
+                            namedSampler = mPostPipelineLuts[lutIdx].sampler.Get();
+                        }
+                    }
+                } else {
+                    std::string alias = samplerName;
+                    bool wantsFeedback = false;
+                    if (alias.size() > 8 && alias.compare(alias.size() - 8, 8, "Feedback") == 0) {
+                        wantsFeedback = true;
+                        alias = alias.substr(0, alias.size() - 8);
+                    }
+                    const int passIdx = GdxFindPipelinePassByAlias(pipeline, alias);
+                    if (passIdx >= 0) {
+                        int fb = -1;
+                        if (wantsFeedback) {
+                            if (passIdx < (int)mPostPipelineFeedbackFbs.size()) {
+                                fb = mPostPipelineFeedbackFbs[passIdx];
+                            }
+                        } else if (passIdx + 1 < (int)mPostPipelineFbs.size()) {
+                            fb = mPostPipelineFbs[passIdx + 1];
+                        }
+                        if (fb >= 0) {
+                            namedSrv = mTextures[mFrameBuffers[fb].texture_id].resource_view.Get();
+                        }
+                    }
+                }
+                mContext->PSSetShaderResources(slot, 1, namedSrv != nullptr ? &namedSrv : &nullSrv);
+                mContext->PSSetSamplers(slot, 1, namedSampler != nullptr ? &namedSampler : &nullSampler);
+            }
+
+            if (prg->constant_buffer.Get() != nullptr) {
+                D3D11_MAPPED_SUBRESOURCE ms;
+                if (prg->isSlang) {
+                    std::vector<uint8_t> cbData(prg->slangCbSize);
+                    GdxSlangHlslCBufferLayout::Pack(prg->slangParameters, parameterOverrides, mFrameCount,
+                                                    cbData.data(), prg->slangUsedBuiltins.extraSizeNames.size());
+                    // uSrcSize / uOutSize live in the same cbuffer slots as the non-slang path,
+                    // as vec4 with the slang convention: xy = size, zw = 1/size.
+                    const float srcSize[4] = { static_cast<float>(srcW), static_cast<float>(srcH),
+                                               1.0f / static_cast<float>(srcW), 1.0f / static_cast<float>(srcH) };
+                    const float dstSize[4] = { static_cast<float>(dstW), static_cast<float>(dstH),
+                                               1.0f / static_cast<float>(dstW), 1.0f / static_cast<float>(dstH) };
+                    std::memcpy(cbData.data(), srcSize, sizeof(srcSize));
+                    std::memcpy(cbData.data() + 16, dstSize, sizeof(dstSize));
+                    // `<Name>Size` vec4s in sorted order, matching the cbuffer the
+                    // translator emitted. History and unrecognized names fall back
+                    // to the native source size.
+                    static const std::regex passOutSizeRe(R"(^Pass(?:Output|Feedback)(\d+)Size$)");
+                    static const std::regex userSizeRe(R"(^User(\d+)Size$)");
+                    size_t sizeIdx = 0;
+                    for (const std::string& sizeName : prg->slangUsedBuiltins.extraSizeNames) {
+                        uint32_t sizeW = nativeW, sizeH = nativeH;
+                        std::smatch sizeMatch;
+                        if (std::regex_match(sizeName, sizeMatch, passOutSizeRe)) {
+                            const int n = std::atoi(sizeMatch[1].str().c_str());
+                            if (n >= 0 && n < (int)passOutSizes.size()) {
+                                sizeW = passOutSizes[n].first;
+                                sizeH = passOutSizes[n].second;
+                            }
+                        } else if (std::regex_match(sizeName, sizeMatch, userSizeRe)) {
+                            const int n = std::atoi(sizeMatch[1].str().c_str());
+                            if (n >= 0 && n < (int)mPostPipelineLuts.size() && mPostPipelineLuts[n].width > 0) {
+                                sizeW = mPostPipelineLuts[n].width;
+                                sizeH = mPostPipelineLuts[n].height;
+                            }
+                        } else if (sizeName.size() > 4) {
+                            const int passIdx =
+                                GdxFindPipelinePassByAlias(pipeline, sizeName.substr(0, sizeName.size() - 4));
+                            if (passIdx >= 0) {
+                                sizeW = passOutSizes[passIdx].first;
+                                sizeH = passOutSizes[passIdx].second;
+                            }
+                        }
+                        const float sizeVec[4] = { static_cast<float>(sizeW), static_cast<float>(sizeH),
+                                                   1.0f / static_cast<float>(sizeW),
+                                                   1.0f / static_cast<float>(sizeH) };
+                        std::memcpy(cbData.data() + GdxSlangHlslCBufferLayout::ExtraSizeOffset(sizeIdx), sizeVec,
+                                    sizeof(sizeVec));
+                        ++sizeIdx;
+                    }
+                    if (SUCCEEDED(mContext->Map(prg->constant_buffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &ms))) {
+                        std::memcpy(ms.pData, cbData.data(), prg->slangCbSize);
+                        mContext->Unmap(prg->constant_buffer.Get(), 0);
+                    }
+                } else {
+                    float cbData[4] = { static_cast<float>(srcW), static_cast<float>(srcH),
+                                        static_cast<float>(dstW), static_cast<float>(dstH) };
+                    if (SUCCEEDED(mContext->Map(prg->constant_buffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &ms))) {
+                        memcpy(ms.pData, cbData, sizeof(cbData));
+                        mContext->Unmap(prg->constant_buffer.Get(), 0);
+                    }
+                }
+                ID3D11Buffer* cb = prg->constant_buffer.Get();
+                mContext->PSSetConstantBuffers(0, 1, &cb);
+                // Translated slang vertex stages read the same cbuffer (MVP, sizes,
+                // parameters); the main renderer never uses VS slot 0, so leaving it
+                // bound after the chain is harmless.
+                mContext->VSSetConstantBuffers(0, 1, &cb);
+            }
+
+            D3D11_VIEWPORT viewport;
+            viewport.TopLeftX = 0.0f;
+            viewport.TopLeftY = 0.0f;
+            viewport.Width = static_cast<float>(dstW);
+            viewport.Height = static_cast<float>(dstH);
+            viewport.MinDepth = 0.0f;
+            viewport.MaxDepth = 1.0f;
+            mContext->RSSetViewports(1, &viewport);
+
+            mContext->IASetInputLayout(prg->input_layout.Get());
+            mContext->VSSetShader(prg->vertex_shader.Get(), nullptr, 0);
+            mContext->PSSetShader(prg->pixel_shader.Get(), nullptr, 0);
+            mContext->OMSetBlendState(prg->blend_state.Get(), nullptr, 0xFFFFFFFF);
+            mContext->OMSetDepthStencilState(nullptr, 0);
+            mContext->RSSetState(prg->rasterizer_state.Get());
+            mContext->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            mContext->Draw(3, 0);
+        }
+
+        srcFb = dstFb;
+        srcW = dstW;
+        srcH = dstH;
+
+        // If this pass feeds back, copy its output into the feedback framebuffer
+        // so PassFeedbackN / `<Alias>Feedback` samples last frame's result next
+        // frame. The framebuffer's existence is the trigger: it is allocated for
+        // every pass anything samples feedback from, flag or not.
+        if (i < mPostPipelineFeedbackFbs.size() && mPostPipelineFeedbackFbs[i] >= 0) {
+            const int fbFb = mPostPipelineFeedbackFbs[i];
+            UpdateFramebufferParameters(fbFb, dstW, dstH, 1, true, true, false, false,
+                                        GdxPipelineFramebufferFormat(pass));
+            TextureData& dstTex = mTextures[mFrameBuffers[dstFb].texture_id];
+            TextureData& fbTex = mTextures[mFrameBuffers[fbFb].texture_id];
+            mContext->CopyResource(fbTex.texture.Get(), dstTex.texture.Get());
+        }
+    }
+
+#if DEBUG_D3D_CHAIN_INFOQUEUE
+    {
+        ComPtr<ID3D11InfoQueue> infoQueue;
+        if (SUCCEEDED(mDevice->QueryInterface(IID_PPV_ARGS(infoQueue.GetAddressOf())))) {
+            const UINT64 messageCount = infoQueue->GetNumStoredMessages();
+            for (UINT64 m = 0; m < messageCount; ++m) {
+                SIZE_T length = 0;
+                infoQueue->GetMessage(m, nullptr, &length);
+                std::vector<uint8_t> buffer(length);
+                D3D11_MESSAGE* message = reinterpret_cast<D3D11_MESSAGE*>(buffer.data());
+                if (SUCCEEDED(infoQueue->GetMessage(m, message, &length))) {
+                    SPDLOG_ERROR("[d3d11-debug] sev={} id={} {}", (int)message->Severity, (int)message->ID,
+                                 message->pDescription ? message->pDescription : "");
+                }
+            }
+            infoQueue->ClearStoredMessages();
+        }
+    }
+#endif
+
+    // Restore device state and invalidate backend caches so the next draw re-binds anything changed.
+    mContext->OMSetRenderTargets(1, prevRTV.GetAddressOf(), prevDSV.Get());
+    if (numViewports > 0) {
+        mContext->RSSetViewports(1, &prevViewport);
+    }
+    mContext->VSSetShader(prevVS.Get(), nullptr, 0);
+    mContext->PSSetShader(prevPS.Get(), nullptr, 0);
+    mContext->GSSetShader(prevGS.Get(), nullptr, 0);
+    mContext->IASetInputLayout(prevIL.Get());
+    mContext->IASetVertexBuffers(0, 1, prevVB.GetAddressOf(), &prevStride, &prevOffset);
+    mContext->IASetPrimitiveTopology(prevTopology);
+    mContext->OMSetBlendState(prevBlend.Get(), prevBlendFactor, prevSampleMask);
+    mContext->OMSetDepthStencilState(prevDepthStencil.Get(), prevStencilRef);
+    mContext->RSSetState(prevRasterizer.Get());
+    mContext->PSSetShaderResources(0, 1, prevSRV.GetAddressOf());
+    mContext->PSSetSamplers(0, 1, prevSampler.GetAddressOf());
+    mContext->PSSetConstantBuffers(0, 1, prevCB.GetAddressOf());
+
+    mLastShaderProgram = nullptr;
+    mLastVertexBufferStride = 0;
+    mLastBlendState.Reset();
+    for (int i = 0; i < SHADER_MAX_TEXTURES; i++) {
+        mLastResourceViews[i].Reset();
+        mLastSamplerStates[i].Reset();
+    }
+    mLastPrimitaveTopology = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+
+    GdxLogPostShaderInfo(fmt::format("pipeline '{}': {} pass(es), {}x{} -> {}x{}", pipeline.presetPath.filename().string(),
+                                     pipeline.passes.size(), nativeW, nativeH, outW, outH));
+
+    return reinterpret_cast<uintptr_t>(GetFramebufferTextureId(mPostPipelineFbs[pipeline.passes.size()]));
 }
 
 void GfxRenderingAPIDX11::SelectTextureFb(int fbID) {

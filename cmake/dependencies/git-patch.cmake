@@ -1,8 +1,10 @@
 # In variables: patch_file, with_reset
 
 function(patch)
+    # --ignore-whitespace lets CRLF patch files (authored on Windows) apply to LF
+    # checkouts and vice versa, so one patch serves both platforms.
     execute_process(
-        COMMAND git apply ${patch_file}
+        COMMAND git apply --ignore-whitespace ${patch_file}
         RESULT_VARIABLE ret
         ERROR_QUIET
     )
@@ -11,7 +13,7 @@ endfunction()
 
 function(check_patch)
     execute_process(
-        COMMAND git apply --reverse --check ${patch_file}
+        COMMAND git apply --reverse --check --ignore-whitespace ${patch_file}
         RESULT_VARIABLE ret
         ERROR_QUIET
     )

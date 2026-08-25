@@ -295,6 +295,15 @@ void GfxWindowBackendDXGI::ApplyMouseCaptureClip() {
     ClipCursor(&rect);
 }
 
+void GfxWindowBackendDXGI::ApplyMouseGrabClip() {
+    RECT rect;
+    rect.left = mPosX;
+    rect.top = mPosY;
+    rect.right = mPosX + current_width;
+    rect.bottom = mPosY + current_height;
+    ClipCursor(&rect);
+}
+
 void GfxWindowBackendDXGI::UpdateMousePrevPos() {
     if (!mHasMousePosition && mIsMouseHovered && !mIsMouseCaptured) {
         mHasMousePosition = true;
@@ -510,6 +519,8 @@ static LRESULT CALLBACK gfx_dxgi_wnd_proc(HWND h_wnd, UINT message, WPARAM w_par
             ControllerUnblockGameInput(ALLOW_BACKGROUND_INPUTS_BLOCK_ID);
             if (self->mIsMouseCaptured) {
                 self->ApplyMouseCaptureClip();
+            } else if (self->mIsMouseGrabbed) {
+                self->ApplyMouseGrabClip();
             }
             break;
         case WM_KILLFOCUS:
@@ -517,6 +528,9 @@ static LRESULT CALLBACK gfx_dxgi_wnd_proc(HWND h_wnd, UINT message, WPARAM w_par
                 if (!ctx->GetConsoleVariables()->GetInteger(CVAR_ALLOW_BACKGROUND_INPUTS, 1)) {
                     ControllerBlockGameInput(ALLOW_BACKGROUND_INPUTS_BLOCK_ID);
                 }
+            }
+            if (self->mIsMouseGrabbed) {
+                ClipCursor(nullptr);
             }
             self->mInFocus = false;
             break;
@@ -721,7 +735,12 @@ void GfxWindowBackendDXGI::SetMouseCapture(bool capture) {
         SetCapture(h_wnd);
         mHasMousePosition = false;
     } else {
-        ClipCursor(nullptr);
+        // Restore the window grab if one was requested; otherwise release the cursor.
+        if (mIsMouseGrabbed) {
+            ApplyMouseGrabClip();
+        } else {
+            ClipCursor(nullptr);
+        }
         SetCursorVisibility(true);
         ReleaseCapture();
         UpdateMousePrevPos();
@@ -730,6 +749,22 @@ void GfxWindowBackendDXGI::SetMouseCapture(bool capture) {
 
 bool GfxWindowBackendDXGI::IsMouseCaptured() {
     return mIsMouseCaptured;
+}
+
+void GfxWindowBackendDXGI::SetMouseGrab(bool grab) {
+    if (mIsMouseGrabbed == grab) {
+        return;
+    }
+    mIsMouseGrabbed = grab;
+    if (mIsMouseCaptured) {
+        // Relative-mode capture owns the cursor; it will restore the grab on release.
+        return;
+    }
+    if (grab) {
+        ApplyMouseGrabClip();
+    } else {
+        ClipCursor(nullptr);
+    }
 }
 
 void GfxWindowBackendDXGI::SetFullscreen(bool enable) {

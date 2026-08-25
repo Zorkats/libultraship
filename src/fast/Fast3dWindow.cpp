@@ -337,6 +337,10 @@ bool Fast3dWindow::IsMouseCaptured() {
     return mWindowManagerApi->IsMouseCaptured();
 }
 
+void Fast3dWindow::SetMouseGrab(bool grab) {
+    mWindowManagerApi->SetMouseGrab(grab);
+}
+
 uint32_t Fast3dWindow::GetCurrentRefreshRate() {
     uint32_t refreshRate;
     mWindowManagerApi->GetActiveWindowRefreshRate(&refreshRate);

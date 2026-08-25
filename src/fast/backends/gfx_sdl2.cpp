@@ -546,10 +546,26 @@ void GfxWindowBackendSDL2::SetMouseCapture(bool capture) {
         mCursorClip = { (w / 2) - 1, (h / 2) - 1, 2, 2 };
     }
     SDL_SetWindowMouseRect(mWnd, capture ? &mCursorClip : NULL);
+    if (!capture) {
+        // Restore the window grab if one was requested; relative mode release would free it.
+        SDL_SetWindowMouseGrab(mWnd, mIsMouseGrabbed ? SDL_TRUE : SDL_FALSE);
+    }
 }
 
 bool GfxWindowBackendSDL2::IsMouseCaptured() {
     return (SDL_GetRelativeMouseMode() == SDL_TRUE);
+}
+
+void GfxWindowBackendSDL2::SetMouseGrab(bool grab) {
+    if (mIsMouseGrabbed == grab) {
+        return;
+    }
+    mIsMouseGrabbed = grab;
+    if (SDL_GetRelativeMouseMode() == SDL_TRUE) {
+        // Relative-mode capture owns the cursor; it will restore the grab on release.
+        return;
+    }
+    SDL_SetWindowMouseGrab(mWnd, grab ? SDL_TRUE : SDL_FALSE);
 }
 
 void GfxWindowBackendSDL2::SetKeyboardCallbacks(bool (*onKeyDown)(int scancode), bool (*onKeyUp)(int scancode),
@@ -783,6 +799,16 @@ void GfxWindowBackendSDL2::HandleSingleEvent(SDL_Event& event) {
 #else
                     SDL_GL_GetDrawableSize(mWnd, &mWindowWidth, &mWindowHeight);
 #endif
+                    break;
+                case SDL_WINDOWEVENT_FOCUS_GAINED:
+                    if (mIsMouseGrabbed && (SDL_GetRelativeMouseMode() != SDL_TRUE)) {
+                        SDL_SetWindowMouseGrab(mWnd, SDL_TRUE);
+                    }
+                    break;
+                case SDL_WINDOWEVENT_FOCUS_LOST:
+                    if (mIsMouseGrabbed) {
+                        SDL_SetWindowMouseGrab(mWnd, SDL_FALSE);
+                    }
                     break;
                 case SDL_WINDOWEVENT_CLOSE:
                     if (event.window.windowID == SDL_GetWindowID(mWnd)) {

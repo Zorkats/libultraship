@@ -3,7 +3,11 @@
 
 #include "gfx_rendering_api.h"
 #include "gfx_shader_cache.h"
+#include "fast/backends/gfx_slang_translator.h"
 #include "../interpreter.h"
+
+#include <atomic>
+#include <memory>
 
 #ifdef _MSC_VER
 #include <SDL2/SDL.h>
@@ -26,6 +30,26 @@
 #include <SDL2/SDL_opengl.h>
 #endif
 namespace Fast {
+
+// Async post-pipeline build state: the worker thread fills passes with translated GLSL sources
+// (no GL calls); the render thread compiles and installs them when state flips to ready.
+struct GdxPostPassBuildOGL {
+    std::string cacheKey;
+    uint64_t mtime = 0;
+    bool ok = false;
+    bool isSlang = false;
+    std::string vsSource;
+    std::string fsSource;
+    std::vector<GdxSlangParameter> slangParameters;
+    GdxSlangUsedBuiltins slangUsedBuiltins;
+};
+
+struct GdxPostPipelineBuildOGL {
+    std::string key;
+    std::vector<GdxPostPassBuildOGL> passes;
+    std::atomic<int> state{ 0 }; // 0 = running, 1 = ready, 2 = failed
+    std::atomic<bool> cancel{ false };
+};
 struct ShaderProgram {
     GLuint openglProgramId;
     uint8_t numInputs;
@@ -52,6 +76,7 @@ struct FramebufferOGL {
     bool has_depth_buffer;
     uint32_t msaa_level;
     bool invertY;
+    GLint lastFormat = 0; // internal format last passed to glTexImage2D; 0 means unset
 
     GLuint fbo, clrbuf, clrbufMsaa, rbo;
 };
@@ -94,7 +119,8 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     int CreateFramebuffer() override;
     void UpdateFramebufferParameters(int fb_id, uint32_t width, uint32_t height, uint32_t msaa_level,
                                      bool opengl_invertY, bool render_target, bool has_depth_buffer,
-                                     bool can_extract_depth) override;
+                                     bool can_extract_depth,
+                                     GdxFramebufferFormat format = GdxFramebufferFormat::R8G8B8A8_UNORM) override;
     void StartDrawToFramebuffer(int fbId, float noiseScale) override;
     void CopyFramebuffer(int fbDstId, int fbSrcId, int srcX0, int srcY0, int srcX1, int srcY1, int dstX0, int dstY0,
                          int dstX1, int dstY1) override;
@@ -106,6 +132,10 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     GetPixelDepth(int fb_id, const std::set<std::pair<float, float>>& coordinates) override;
     void* GetFramebufferTextureId(int fbId) override;
     void SelectTextureFb(int fbId) override;
+    uintptr_t ApplyPostShader(int srcFbId, int mode, uint32_t nativeW, uint32_t nativeH, uint32_t outW,
+                              uint32_t outH) override;
+    uintptr_t ApplyPostShaderChain(int srcFbId, const GdxPostShaderPipeline& pipeline, uint32_t nativeW,
+                                   uint32_t nativeH, uint32_t outW, uint32_t outH) override;
     void DeleteTexture(uint32_t texId) override;
     void SetTextureFilter(FilteringMode mode) override;
     FilteringMode GetTextureFilter() override;
@@ -150,6 +180,60 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
     // template expansion, glCompileShader and glLinkProgram. Sidecar only -- GL program binaries
     // are specific to the vendor, GPU and driver version, so nothing here can be shipped.
     ShaderBlobCache mShaderCache;
+
+    // CRT post-process pass (gEnhancements.Graphics.CRTShader, ApplyPostShader). Programs compile
+    // lazily once per mode and deliberately stay out of mShaderCache; the downsample and output
+    // framebuffers are created on first use and resized by UpdateFramebufferParameters.
+    struct PostShaderProgramOGL {
+        GLuint program = 0;
+        GLint srcSizeLocation = -1;
+        GLint outSizeLocation = -1;
+        bool attempted = false; // a failed compile is cached too, so it is not retried per frame
+        uint64_t mtime = 0;     // used by the pipeline cache for hot-reload on save
+        bool isSlang = false;
+        std::vector<GdxSlangParameter> slangParameters;
+        std::unordered_map<std::string, GLint> slangParameterLocations;
+        GdxSlangUsedBuiltins slangUsedBuiltins;
+        std::unordered_map<std::string, GLint> slangSamplerLocations;
+        std::unordered_map<std::string, GLint> slangExtraSizeLocations; // `<Name>Size` vec4 uniforms
+        GLint slangFrameCountLocation = -1;
+        GLint slangMvpLocation = -1;
+    };
+    void GdxInitPostProgramOGL(PostShaderProgramOGL* prg);
+    friend bool GdxCompilePipelinePassOGL(const std::filesystem::path& path, GfxRenderingAPIOGL* self,
+                                          PostShaderProgramOGL* outPrg);
+    friend GdxSlangUsedBuiltins GdxUnionUsedBuiltins(const std::vector<PostShaderProgramOGL*>& programs);
+    friend bool GdxLoadPipelineLutsOGL(const GdxPostShaderPipeline& pipeline, std::vector<GLuint>* outTextures,
+                                       std::vector<std::filesystem::path>* outPaths,
+                                       std::vector<std::pair<uint32_t, uint32_t>>* outSizes);
+    PostShaderProgramOGL mPostShaderPrograms[2];
+    std::unordered_map<std::string, std::pair<PostShaderProgramOGL, uint64_t>> mPostShaderCustomCache;
+    int mPostDownsampleFb = -1;
+    int mPostOutputFb = -1;
+#if defined(__APPLE__) || defined(USE_OPENGLES)
+    GLuint mPostVao = 0; // attribute-less fullscreen triangle still needs a VAO on core profiles
+#endif
+
+    // Multi-pass pipeline state. Recompiled and reallocated when the pipeline or any pass file
+    // changes on disk.
+    std::unordered_map<std::string, PostShaderProgramOGL> mPostPipelineProgramCache;
+    std::vector<int> mPostPipelineFbs;
+
+    // Slice 3: history ring for OriginalHistoryN, feedback storage for
+    // PassFeedbackN, and LUT textures for UserN.
+    std::vector<int> mPostPipelineHistoryFbs;
+    size_t mPostPipelineHistoryIndex = 0;
+    std::vector<int> mPostPipelineFeedbackFbs;
+    std::vector<GLuint> mPostPipelineLutTextures;
+    std::vector<std::pair<uint32_t, uint32_t>> mPostPipelineLutSizes; // UserNSize fills from these
+    std::vector<std::filesystem::path> mPostPipelineLutPaths;
+
+    // Async pipeline build (see GdxPostPipelineBuildOGL above).
+    std::shared_ptr<GdxPostPipelineBuildOGL> mPostPipelineBuild;
+    std::string mPostPipelineReadyKey;
+    std::string mPostPipelineFailedKey;
+
+    friend bool GdxInstallPostPipelineBuildOGL(GfxRenderingAPIOGL* self, GdxPostPipelineBuildOGL* build);
 };
 
 } // namespace Fast

@@ -6,8 +6,10 @@
 
 namespace Ship {
 
-#define DEFAULT_HIGH_FREQUENCY_RUMBLE_PERCENTAGE 50
-#define DEFAULT_LOW_FREQUENCY_RUMBLE_PERCENTAGE 50
+// N64 rumble pak is full-motor on/off; default the PC port's SDL mapping to full amplitude so
+// that 100% on the slider matches the original hardware's "motor on" strength.
+#define DEFAULT_HIGH_FREQUENCY_RUMBLE_PERCENTAGE 100
+#define DEFAULT_LOW_FREQUENCY_RUMBLE_PERCENTAGE 100
 
 /**
  * @brief Maps rumble (haptic feedback) output to a physical controller.

@@ -83,6 +83,16 @@ target_link_libraries(libultraship
     PUBLIC ImGui
 )
 
+# glslang + SPIRV-Cross for RetroArch .slang translation (Slice 2).
+target_link_libraries(libultraship PUBLIC
+    glslang
+    glslang-default-resource-limits
+    SPIRV
+    spirv-cross-core
+    spirv-cross-glsl
+    spirv-cross-hlsl
+)
+
 target_link_libraries(libultraship PRIVATE stb)
 
 if (GFX_DEBUG_DISASSEMBLER)

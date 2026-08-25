@@ -8,6 +8,7 @@
 
 namespace Fast {
 struct ShaderProgram;
+struct GdxPostShaderPipeline;
 
 struct GfxClipParameters {
     bool z_is_from_0_to_1;
@@ -15,6 +16,15 @@ struct GfxClipParameters {
 };
 
 enum FilteringMode { FILTER_THREE_POINT, FILTER_LINEAR, FILTER_NONE };
+
+// Color formats used when a framebuffer is created as a render target. Most
+// callers use the default RGBA8; the post-processing pipeline may request
+// floating-point or sRGB storage per pass.
+enum class GdxFramebufferFormat {
+    R8G8B8A8_UNORM,
+    R16G16B16A16_FLOAT,
+    R8G8B8A8_UNORM_SRGB,
+};
 
 // A hash function used to hash a: pair<float, float>
 struct hash_pair_ff {
@@ -57,7 +67,8 @@ class GfxRenderingAPI {
     virtual int CreateFramebuffer() = 0;
     virtual void UpdateFramebufferParameters(int fb_id, uint32_t width, uint32_t height, uint32_t msaa_level,
                                              bool opengl_invertY, bool render_target, bool has_depth_buffer,
-                                             bool can_extract_depth) = 0;
+                                             bool can_extract_depth,
+                                             GdxFramebufferFormat format = GdxFramebufferFormat::R8G8B8A8_UNORM) = 0;
     virtual void StartDrawToFramebuffer(int fbId, float noiseScale) = 0;
     virtual void CopyFramebuffer(int fbDstId, int fbSrcId, int srcX0, int srcY0, int srcX1, int srcY1, int dstX0,
                                  int dstY0, int dstX1, int dstY1) = 0;
@@ -73,6 +84,20 @@ class GfxRenderingAPI {
     GetPixelDepth(int fb_id, const std::set<std::pair<float, float>>& coordinates) = 0;
     virtual void* GetFramebufferTextureId(int fbId) = 0;
     virtual void SelectTextureFb(int fbId) = 0;
+    // Post-process hook (gEnhancements.Graphics.CRTShader / CustomShader): downsample
+    // srcFbId's colour to nativeW x nativeH, run it through post-shader `mode` (1 = scanlines,
+    // 2 = CRT) into an outW x outH target, and return that target's texture id for the interpreter
+    // to publish. 0 = not applied; the caller then presents the source framebuffer as usual.
+    virtual uintptr_t ApplyPostShader(int srcFbId, int mode, uint32_t nativeW, uint32_t nativeH, uint32_t outW,
+                                      uint32_t outH) {
+        return 0;
+    }
+    // Multi-pass pipeline hook (gEnhancements.Graphics.PostPipeline). Runs the parsed .slangp
+    // chain through per-pass render targets and returns the final texture id. 0 = not applied.
+    virtual uintptr_t ApplyPostShaderChain(int srcFbId, const GdxPostShaderPipeline& pipeline, uint32_t nativeW,
+                                           uint32_t nativeH, uint32_t outW, uint32_t outH) {
+        return 0;
+    }
     virtual void DeleteTexture(uint32_t texId) = 0;
     virtual void SetTextureFilter(FilteringMode mode) = 0;
     virtual FilteringMode GetTextureFilter() = 0;

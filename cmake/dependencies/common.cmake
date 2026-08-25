@@ -328,3 +328,44 @@ if(NOT TARGET libtcc)
 endif()
 
 endif() # ENABLE_SCRIPTING
+
+#=================== glslang + SPIRV-Cross (RetroArch .slang translation) ===================
+# Slice 2 brings in real .slang support. We only need the compiler front-end (glslang + SPIRV)
+# and the GLSL/HLSL backends from SPIRV-Cross. ENABLE_OPT=OFF keeps SPIRV-Tools out of the tree
+# and avoids a long optional dependency chain.
+FetchContent_Declare(
+    glslang
+    GIT_REPOSITORY https://github.com/KhronosGroup/glslang.git
+    GIT_TAG        15.2.0
+)
+set(ENABLE_OPT OFF CACHE BOOL "" FORCE)
+set(ENABLE_GLSLANG_BINARIES OFF CACHE BOOL "" FORCE)
+set(ENABLE_SPVREMAPPER OFF CACHE BOOL "" FORCE)
+set(ENABLE_CTEST OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(glslang)
+
+FetchContent_Declare(
+    SPIRV-Cross
+    GIT_REPOSITORY https://github.com/KhronosGroup/SPIRV-Cross.git
+    GIT_TAG        vulkan-sdk-1.4.304.0
+)
+set(SPIRV_CROSS_CLI OFF CACHE BOOL "" FORCE)
+set(SPIRV_CROSS_ENABLE_TESTS OFF CACHE BOOL "" FORCE)
+set(SPIRV_CROSS_ENABLE_HLSL ON CACHE BOOL "" FORCE)
+set(SPIRV_CROSS_ENABLE_GLSL ON CACHE BOOL "" FORCE)
+set(SPIRV_CROSS_ENABLE_MSL OFF CACHE BOOL "" FORCE)
+set(SPIRV_CROSS_ENABLE_REFLECT OFF CACHE BOOL "" FORCE)
+set(SPIRV_CROSS_ENABLE_CPP OFF CACHE BOOL "" FORCE)
+set(SPIRV_CROSS_ENABLE_C_API OFF CACHE BOOL "" FORCE)
+set(SPIRV_CROSS_ENABLE_UTIL OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(SPIRV-Cross)
+
+list(APPEND ADDITIONAL_LIB_INCLUDES
+    ${glslang_SOURCE_DIR}
+    ${glslang_SOURCE_DIR}/glslang/Public
+    ${glslang_SOURCE_DIR}/glslang/Include
+    ${spirv-cross_SOURCE_DIR}
+)
+
+# Linking libultraship against these targets happens in libultraship/src/CMakeLists.txt
+# after the libultraship target is created; doing it there guarantees TARGET exists.

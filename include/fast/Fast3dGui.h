@@ -135,6 +135,19 @@ class Fast3dGui : public Ship::Gui {
 
     void RefreshImGuiGamepads() override;
 
+    /**
+     * @brief Returns the client-space rect the game framebuffer was blitted into by the last
+     * DrawGame() call.
+     *
+     * Host-side mouse code (G-Diffuser's Course Edit absolute drive) needs to invert the blit to
+     * map a window mouse position back to 320x240 game space; storing the rect here beats
+     * re-deriving the pillarbox/letterbox branch above outside the class.
+     *
+     * @param x,y,w,h Out parameters in window client coordinates.
+     * @return false until the first successful blit (no framebuffer yet).
+     */
+    bool GetGameBlitRect(float* x, float* y, float* w, float* h);
+
   protected:
     void ImGuiWMInit() override;
     void ImGuiWMShutdown() override;
@@ -172,5 +185,9 @@ class Fast3dGui : public Ship::Gui {
     int16_t GetIntegerScaleFactor();
 
     std::unordered_map<std::string, Ship::GuiTextureMetadata> mGuiTextures; ///< Cached GPU texture registry.
+
+    ImVec2 mGameBlitPos{ 0, 0 };  ///< Client-space origin of the last game-framebuffer blit.
+    ImVec2 mGameBlitSize{ 0, 0 }; ///< Client-space size of the last game-framebuffer blit.
+    bool mGameBlitValid = false;  ///< False until DrawGame() has blitted a framebuffer once.
 };
 } // namespace Fast

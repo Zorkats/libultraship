@@ -547,6 +547,8 @@ enum class F3dex2Variant : uint8_t {
 // addresses into a semantic variant switch.
 constexpr uintptr_t F3DEX2_VARIANT_SWITCH_MARKER = 0x47445800u;
 
+struct GdxPostShaderPipeline;
+
 class Interpreter {
   public:
     Interpreter();
@@ -599,6 +601,12 @@ class Interpreter {
     void ResetGeometryDiagnostics();
     const GeometryDiagnostics& GetGeometryDiagnostics() const;
     void SetF3dex2Variant(F3dex2Variant variant);
+    // [interp-idem] Deterministic baseline for frame-interpolation replay passes (k > 0).
+    // Zeroes every piece of emulated RDP/RSP state that survives Run() and invalidates the
+    // renderer-side tracked state so the replay re-applies everything, while deliberately NOT
+    // touching the content-keyed GPU texture cache or any live resource handle (the reverted
+    // full *mRdp restore did both and broke boost/heal plates and the HUD digit).
+    void ResetRdpForReplay();
 
     // private: TODO make these private
     void Flush();
@@ -740,6 +748,19 @@ class Interpreter {
     bool mUltrawideCache = false;
     bool mRemoveBordersCache = false;
     float mHudMaxAspectCache = 1000.0f;
+    // Latched with the graphics CVars above: gEnhancements.Graphics.CRTShader (0 = off,
+    // 1 = scanlines, 2 = CRT), gEnhancements.Graphics.CustomShader (non-empty stem), and
+    // gEnhancements.Graphics.PostPipeline (path to a .slangp preset). Any active post-process
+    // option forces the offscreen render path so the epilogue can downsample the frame and run
+    // the shader chain before DrawGame presents.
+    int mPostShaderCache = 0;
+    std::string mPostPipelineCache;
+    std::unique_ptr<GdxPostShaderPipeline> mPostPipeline;
+    // Failed-parse cache: a preset that fails to parse must not be re-parsed every frame
+    // (re-read + SPDLOG_ERROR per frame stutters and floods the log). Retry only when the
+    // preset file changes on disk or the user picks another preset.
+    std::string mPostPipelineFailedPath;
+    uint64_t mPostPipelineFailedMtime = 0;
     std::map<int, FBInfo>::iterator mActiveFrameBuffer;
     std::map<int, FBInfo> mFrameBuffers;
 

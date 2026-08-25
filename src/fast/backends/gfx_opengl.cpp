@@ -6,8 +6,13 @@
 #include <stdio.h>
 #include <cstring>
 
+#include <algorithm>
 #include <chrono>
+#include <filesystem>
 #include <map>
+#include <regex>
+#include <sstream>
+#include <thread>
 #include <unordered_map>
 
 #ifndef _LANGUAGE_C
@@ -21,13 +26,18 @@
 #endif
 
 #include "fast/backends/gfx_opengl.h"
+#include "fast/backends/gfx_post_shader_pipeline.h"
 #include "ship/window/gui/Gui.h"
+#include <stb_image.h>
 #include <prism/processor.h>
 #include <fstream>
 #include "ship/Context.h"
 #include "ship/resource/factory/ShaderFactory.h"
 #include "fast/interpreter.h"
+#include "spdlog/spdlog.h"
+#include <spdlog/fmt/fmt.h>
 #include "ship/config/ConsoleVariable.h"
+#include "libultraship/bridge/consolevariablebridge.h"
 
 namespace Fast {
 int GfxRenderingAPIOGL::GetMaxTextureSize() {
@@ -1034,7 +1044,7 @@ int GfxRenderingAPIOGL::CreateFramebuffer() {
 
 void GfxRenderingAPIOGL::UpdateFramebufferParameters(int fb_id, uint32_t width, uint32_t height, uint32_t msaa_level,
                                                      bool opengl_invertY, bool render_target, bool has_depth_buffer,
-                                                     bool can_extract_depth) {
+                                                     bool can_extract_depth, GdxFramebufferFormat format) {
     FramebufferOGL& fb = mFrameBuffers[fb_id];
 
     width = std::max(width, 1U);
@@ -1044,10 +1054,32 @@ void GfxRenderingAPIOGL::UpdateFramebufferParameters(int fb_id, uint32_t width, 
     glBindFramebuffer(GL_FRAMEBUFFER, fb.fbo);
 
     if (fb_id != 0) {
-        if (fb.width != width || fb.height != height || fb.msaa_level != msaa_level) {
+        // Post-pipeline passes need alpha-capable storage; keep GL_RGB8 for the
+        // default path so existing callers are unaffected.
+        GLenum internalFormat = GL_RGB8;
+        GLenum pixelFormat = GL_RGB;
+        switch (format) {
+            case GdxFramebufferFormat::R8G8B8A8_UNORM:
+                internalFormat = GL_RGBA8;
+                pixelFormat = GL_RGBA;
+                break;
+            case GdxFramebufferFormat::R16G16B16A16_FLOAT:
+                internalFormat = GL_RGBA16F;
+                pixelFormat = GL_RGBA;
+                break;
+            case GdxFramebufferFormat::R8G8B8A8_UNORM_SRGB:
+                internalFormat = GL_SRGB8_ALPHA8;
+                pixelFormat = GL_RGBA;
+                break;
+            default:
+                break;
+        }
+
+        if (fb.width != width || fb.height != height || fb.msaa_level != msaa_level || fb.lastFormat != internalFormat) {
             if (msaa_level <= 1) {
                 glBindTexture(GL_TEXTURE_2D, fb.clrbuf);
-                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, width, height, 0, GL_RGB, GL_UNSIGNED_BYTE, NULL);
+                glTexImage2D(GL_TEXTURE_2D, 0, internalFormat, width, height, 0, pixelFormat,
+                             internalFormat == GL_RGBA16F ? GL_HALF_FLOAT : GL_UNSIGNED_BYTE, NULL);
                 glBindTexture(GL_TEXTURE_2D, 0);
                 // Same cache invalidation as in CreateFramebuffer above. Gated on a size/MSAA
                 // change, so the symptom is a one-frame wrong-texture glitch after a resize
@@ -1058,10 +1090,11 @@ void GfxRenderingAPIOGL::UpdateFramebufferParameters(int fb_id, uint32_t width, 
                 glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, fb.clrbuf, 0);
             } else {
                 glBindRenderbuffer(GL_RENDERBUFFER, fb.clrbufMsaa);
-                glRenderbufferStorageMultisample(GL_RENDERBUFFER, msaa_level, GL_RGB8, width, height);
+                glRenderbufferStorageMultisample(GL_RENDERBUFFER, msaa_level, internalFormat, width, height);
                 glBindRenderbuffer(GL_RENDERBUFFER, 0);
                 glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, fb.clrbufMsaa);
             }
+            fb.lastFormat = internalFormat;
         }
 
         if (has_depth_buffer &&
@@ -1164,7 +1197,11 @@ void GfxRenderingAPIOGL::ResolveMSAAColorBuffer(int fb_id_target, int fb_id_sour
         glDisable(GL_SCISSOR_TEST);
     }
 
-    glBlitFramebuffer(0, 0, fb_src.width, fb_src.height, 0, 0, fb_dst.width, fb_dst.height, GL_COLOR_BUFFER_BIT,
+    GLint dstY0 = 0, dstY1 = (GLint)fb_dst.height;
+    if (fb_src.invertY != fb_dst.invertY) {
+        std::swap(dstY0, dstY1);
+    }
+    glBlitFramebuffer(0, 0, fb_src.width, fb_src.height, 0, dstY0, fb_dst.width, dstY1, GL_COLOR_BUFFER_BIT,
                       GL_NEAREST);
     // mCurrentFrameBuffer is an index into mFrameBuffers, not a GL name; passing it straight to
     // glBindFramebuffer only worked when the index happened to be 0.
@@ -1214,6 +1251,1161 @@ void GfxRenderingAPIOGL::SelectTextureFb(int fb_id) {
     textures[texId].width = (uint16_t)fb.width;
     textures[texId].height = (uint16_t)fb.height;
     textures[texId].filtering = FILTER_THREE_POINT;
+}
+
+/*
+ * CRT post-process pass (gEnhancements.Graphics.CRTShader). The vertex shader is attribute-less
+ * (gl_VertexID, available in every profile this file targets): the combiner programs own the
+ * vertex attrib state and LoadShader re-applies it only on a combiner change, so a pass that
+ * touched attrib pointers could leave stale state behind for the next frame's first draw.
+ */
+#ifdef __APPLE__
+#define GDX_POST_VS                                                                            \
+    "#version 410 core\n"                                                                      \
+    "out vec2 vUV;\n"
+#define GDX_POST_FS_PRELUDE                                                                    \
+    "#version 410 core\n"                                                                      \
+    "in vec2 vUV;\n"                                                                           \
+    "out vec4 gdxFragColor;\n"
+#define GDX_POST_SAMPLE "texture"
+#elif defined(USE_OPENGLES)
+#define GDX_POST_VS                                                                            \
+    "#version 300 es\n"                                                                        \
+    "out vec2 vUV;\n"
+#define GDX_POST_FS_PRELUDE                                                                    \
+    "#version 300 es\n"                                                                        \
+    "precision mediump float;\n"                                                               \
+    "in vec2 vUV;\n"                                                                           \
+    "out vec4 gdxFragColor;\n"
+#define GDX_POST_SAMPLE "texture"
+#else
+#define GDX_POST_VS                                                                            \
+    "#version 130\n"                                                                           \
+    "varying vec2 vUV;\n"
+#define GDX_POST_FS_PRELUDE                                                                    \
+    "#version 130\n"                                                                           \
+    "varying vec2 vUV;\n"                                                                      \
+    "#define gdxFragColor gl_FragColor\n"
+#define GDX_POST_SAMPLE "texture2D"
+#endif
+
+static const char* sGdxPostVsSource = GDX_POST_VS
+    "void main() {\n"
+    "    vec2 pos = vec2(gl_VertexID == 1 ? 3.0 : -1.0, gl_VertexID == 2 ? 3.0 : -1.0);\n"
+    "    vUV = pos * 0.5 + 0.5;\n"
+    "    gl_Position = vec4(pos, 0.0, 1.0);\n"
+    "}\n";
+
+// Translated .slang shaders emit GLSL 330 with in/out varyings, so the vertex
+// shader must match that profile.
+static const char* sGdxPostVsSource330 = R"(
+#version 330
+out vec2 vUV;
+void main() {
+    vec2 pos = vec2(gl_VertexID == 1 ? 3.0 : -1.0, gl_VertexID == 2 ? 3.0 : -1.0);
+    vUV = pos * 0.5 + 0.5;
+    gl_Position = vec4(pos, 0.0, 1.0);
+}
+)";
+
+// uSrcSize is the native N64 resolution the downsample target holds: scanlines key on source
+// rows, not output pixels, so the line count stays authentic at any window size.
+static const char* sGdxPostFsScanlines = GDX_POST_FS_PRELUDE
+    "uniform sampler2D uTex;\n"
+    "uniform vec2 uSrcSize;\n"
+    "uniform vec2 uOutSize;\n"
+    "void main() {\n"
+    "    vec2 uv = vec2(vUV.x, 1.0 - vUV.y);\n"
+    "    vec3 color = " GDX_POST_SAMPLE "(uTex, uv).rgb;\n"
+    "    float scan = 0.80 + 0.20 * cos(6.2831853 * (fract(uv.y * uSrcSize.y) - 0.5));\n"
+    "    gdxFragColor = vec4(color * scan, 1.0);\n"
+    "}\n";
+
+// Scanlines plus an aperture-grille mask: each output column keeps one channel at full gain.
+// The gamma lift recovers the brightness the mask and scanlines remove.
+static const char* sGdxPostFsCrt = GDX_POST_FS_PRELUDE
+    "uniform sampler2D uTex;\n"
+    "uniform vec2 uSrcSize;\n"
+    "uniform vec2 uOutSize;\n"
+    "void main() {\n"
+    "    vec2 uv = vec2(vUV.x, 1.0 - vUV.y);\n"
+    "    vec3 color = " GDX_POST_SAMPLE "(uTex, uv).rgb;\n"
+    "    float scan = 0.80 + 0.20 * cos(6.2831853 * (fract(uv.y * uSrcSize.y) - 0.5));\n"
+    "    float phase = mod(floor(uv.x * uOutSize.x), 3.0);\n"
+    "    vec3 mask = vec3(0.75);\n"
+    "    if (phase < 0.5) {\n"
+    "        mask.r = 1.0;\n"
+    "    } else if (phase < 1.5) {\n"
+    "        mask.g = 1.0;\n"
+    "    } else {\n"
+    "        mask.b = 1.0;\n"
+    "    }\n"
+    "    color = pow(color * scan * mask, vec3(0.85));\n"
+    "    gdxFragColor = vec4(color, 1.0);\n"
+    "}\n";
+
+// Unlike the combiner path, a failed compile must not abort(): the interpreter falls back to
+// presenting the unfiltered framebuffer when this returns 0.
+static GLuint GdxCompilePostProgram(const char* vsSource, const char* fsSource) {
+    GLint success;
+    GLuint vertexShader = glCreateShader(GL_VERTEX_SHADER);
+    glShaderSource(vertexShader, 1, &vsSource, nullptr);
+    glCompileShader(vertexShader);
+    glGetShaderiv(vertexShader, GL_COMPILE_STATUS, &success);
+    if (!success) {
+        char log[1024];
+        glGetShaderInfoLog(vertexShader, sizeof(log), nullptr, log);
+        SPDLOG_ERROR("Post vertex shader compilation failed: {}", log);
+        glDeleteShader(vertexShader);
+        return 0;
+    }
+
+    GLuint fragmentShader = glCreateShader(GL_FRAGMENT_SHADER);
+    glShaderSource(fragmentShader, 1, &fsSource, nullptr);
+    glCompileShader(fragmentShader);
+    glGetShaderiv(fragmentShader, GL_COMPILE_STATUS, &success);
+    if (!success) {
+        char log[1024];
+        glGetShaderInfoLog(fragmentShader, sizeof(log), nullptr, log);
+        SPDLOG_ERROR("Post fragment shader compilation failed: {}", log);
+        glDeleteShader(vertexShader);
+        glDeleteShader(fragmentShader);
+        return 0;
+    }
+
+    GLuint program = glCreateProgram();
+    glAttachShader(program, vertexShader);
+    glAttachShader(program, fragmentShader);
+    glLinkProgram(program);
+    glDeleteShader(vertexShader);
+    glDeleteShader(fragmentShader);
+
+    glGetProgramiv(program, GL_LINK_STATUS, &success);
+    if (!success) {
+        char log[1024];
+        glGetProgramInfoLog(program, sizeof(log), nullptr, log);
+        SPDLOG_ERROR("Post shader link failed: {}", log);
+        glDeleteProgram(program);
+        return 0;
+    }
+    return program;
+}
+
+// The user writes only the fragment-shader body (a void main() that uses uTex/uSrcSize/uOutSize/vUV
+// and writes gdxFragColor). The backend injects the correct #version and declarations for the
+// active GL profile, so a single .glsl file works on desktop, Apple core, and GLES.
+static std::string GdxBuildCustomPostFsSource(const std::string& userBody) {
+#ifdef __APPLE__
+    return std::string("#version 410 core\n"
+                       "in vec2 vUV;\n"
+                       "out vec4 gdxFragColor;\n"
+                       "uniform sampler2D uTex;\n"
+                       "uniform vec2 uSrcSize;\n"
+                       "uniform vec2 uOutSize;\n") +
+           userBody;
+#elif defined(USE_OPENGLES)
+    return std::string("#version 300 es\n"
+                       "precision mediump float;\n"
+                       "in vec2 vUV;\n"
+                       "out vec4 gdxFragColor;\n"
+                       "uniform sampler2D uTex;\n"
+                       "uniform vec2 uSrcSize;\n"
+                       "uniform vec2 uOutSize;\n") +
+           userBody;
+#else
+    return std::string("#version 130\n"
+                       "varying vec2 vUV;\n"
+                       "#define gdxFragColor gl_FragColor\n"
+                       "uniform sampler2D uTex;\n"
+                       "uniform vec2 uSrcSize;\n"
+                       "uniform vec2 uOutSize;\n") +
+           userBody;
+#endif
+}
+
+// Rate-limited INFO logging for the post-pass hot path so the active shader is visible without
+// spamming the log on every frame.
+static void GdxLogPostShaderInfo(const std::string& message) {
+    static auto sLastLog = std::chrono::steady_clock::now();
+    auto now = std::chrono::steady_clock::now();
+    if (std::chrono::duration_cast<std::chrono::seconds>(now - sLastLog).count() >= 3) {
+        sLastLog = now;
+        SPDLOG_INFO("[post-shader] {}", message);
+    }
+}
+
+static std::string GdxReadShaderFile(const std::filesystem::path& path) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        return "";
+    }
+    std::ostringstream ss;
+    ss << file.rdbuf();
+    std::string result = ss.str();
+    // Strip UTF-8 BOM so GLSL compilers do not choke on it.
+    if (result.size() >= 3 && (unsigned char)result[0] == 0xEF && (unsigned char)result[1] == 0xBB &&
+        (unsigned char)result[2] == 0xBF) {
+        result.erase(0, 3);
+    }
+    return result;
+}
+
+void GfxRenderingAPIOGL::GdxInitPostProgramOGL(PostShaderProgramOGL* prg) {
+    if (prg->program == 0) {
+        return;
+    }
+    prg->srcSizeLocation = glGetUniformLocation(prg->program, "uSrcSize");
+    prg->outSizeLocation = glGetUniformLocation(prg->program, "uOutSize");
+    // Sampler bindings are program state, but glUniform writes to the BOUND program:
+    // restore whatever was bound so mLastLoadedShader's cache stays truthful.
+    GLint curProgram = 0;
+    glGetIntegerv(GL_CURRENT_PROGRAM, &curProgram);
+    glUseProgram(prg->program);
+    glUniform1i(glGetUniformLocation(prg->program, "uTex"), 0);
+    for (const GdxSlangParameter& p : prg->slangParameters) {
+        prg->slangParameterLocations[p.name] = glGetUniformLocation(prg->program, p.name.c_str());
+    }
+    prg->slangFrameCountLocation = glGetUniformLocation(prg->program, "gdxFrameCount");
+    prg->slangMvpLocation = glGetUniformLocation(prg->program, "gdxMvp");
+
+    // Slice 3: cache locations for the extra sampler families so each pass can
+    // bind them to the fixed convention slots emitted by the translator.
+    auto cacheSampler = [&](const std::string& base, int n, int binding) {
+        const std::string name = base + std::to_string(n);
+        GLint loc = glGetUniformLocation(prg->program, name.c_str());
+        if (loc >= 0) {
+            glUniform1i(loc, binding);
+            prg->slangSamplerLocations[name] = loc;
+        }
+    };
+    for (int n = 0; n <= prg->slangUsedBuiltins.maxOriginalHistory; ++n) {
+        cacheSampler("gdxOriginalHistory", n, GdxSlangTextureBindings::OriginalHistory(n));
+    }
+    for (int n : prg->slangUsedBuiltins.passOutputIndices) {
+        cacheSampler("gdxPassOutput", n, GdxSlangTextureBindings::PassOutput(n));
+    }
+    for (int n : prg->slangUsedBuiltins.passFeedbackIndices) {
+        cacheSampler("gdxPassFeedback", n, GdxSlangTextureBindings::PassFeedback(n));
+    }
+    for (int n : prg->slangUsedBuiltins.userTextureIndices) {
+        cacheSampler("gdxUser", n, GdxSlangTextureBindings::User(n));
+    }
+    for (size_t k = 0; k < prg->slangUsedBuiltins.namedSamplers.size(); ++k) {
+        cacheSampler("gdxNamed", static_cast<int>(k), GdxSlangTextureBindings::Named(static_cast<int>(k)));
+    }
+    for (const std::string& sizeName : prg->slangUsedBuiltins.extraSizeNames) {
+        prg->slangExtraSizeLocations[sizeName] = glGetUniformLocation(prg->program, sizeName.c_str());
+    }
+
+    glUseProgram((GLuint)curProgram);
+}
+
+uintptr_t GfxRenderingAPIOGL::ApplyPostShader(int srcFbId, int mode, uint32_t nativeW, uint32_t nativeH,
+                                              uint32_t outW, uint32_t outH) {
+    if (srcFbId <= 0 || srcFbId >= (int)mFrameBuffers.size() || nativeW == 0 || nativeH == 0 || outW == 0 ||
+        outH == 0) {
+        return 0;
+    }
+
+    PostShaderProgramOGL* prg = nullptr;
+    const char* customStem = CVarGetString("gEnhancements.Graphics.CustomShader", "");
+    if (customStem != nullptr && customStem[0] != '\0') {
+        if (strchr(customStem, '\\') != nullptr || strchr(customStem, '/') != nullptr ||
+            strchr(customStem, '.') != nullptr) {
+            SPDLOG_ERROR("Invalid custom shader stem '{}': must be a plain file name", customStem);
+            return 0;
+        }
+        std::filesystem::path shaderPath =
+            std::filesystem::path(Ship::Context::GetAppDirectoryPath()) / "shaders" / (std::string(customStem) + ".glsl");
+        GdxLogPostShaderInfo(fmt::format("scan/select: custom stem '{}' -> {}", customStem, shaderPath.string()));
+        if (!std::filesystem::exists(shaderPath)) {
+            SPDLOG_ERROR("Custom shader file not found: {}", shaderPath.string());
+            return 0;
+        }
+        uint64_t mtimeTicks =
+            static_cast<uint64_t>(std::filesystem::last_write_time(shaderPath).time_since_epoch().count());
+        auto& entry = mPostShaderCustomCache[customStem];
+        if (!entry.first.attempted || entry.second != mtimeTicks) {
+            entry.second = mtimeTicks;
+            entry.first = {}; // drop stale GL program before recompiling
+            entry.first.attempted = true;
+            std::string userBody = GdxReadShaderFile(shaderPath);
+            if (userBody.empty()) {
+                SPDLOG_ERROR("Custom shader file is empty or could not be read: {}", shaderPath.string());
+                return 0;
+            }
+            std::string fsSource = GdxBuildCustomPostFsSource(userBody);
+            entry.first.program = GdxCompilePostProgram(sGdxPostVsSource, fsSource.c_str());
+            if (entry.first.program == 0) {
+                SPDLOG_ERROR("Custom shader compile failed: {}", shaderPath.string());
+                return 0;
+            }
+            GdxLogPostShaderInfo(fmt::format("compile: custom shader '{}' compiled successfully",
+                                             shaderPath.string()));
+            GdxInitPostProgramOGL(&entry.first);
+        }
+        prg = &entry.first;
+    } else {
+        if (mode < 1 || mode > 2) {
+            return 0;
+        }
+        PostShaderProgramOGL& modePrg = mPostShaderPrograms[mode - 1];
+        if (!modePrg.attempted) {
+            modePrg.attempted = true;
+            modePrg.program = GdxCompilePostProgram(sGdxPostVsSource, mode == 1 ? sGdxPostFsScanlines : sGdxPostFsCrt);
+            GdxInitPostProgramOGL(&modePrg);
+        }
+        prg = &modePrg;
+    }
+    if (prg == nullptr || prg->program == 0) {
+        return 0;
+    }
+
+    const FramebufferOGL& src = mFrameBuffers[srcFbId];
+
+    if (mPostDownsampleFb < 0) {
+        mPostDownsampleFb = CreateFramebuffer();
+        // The post pass upscales with NEAREST for crisp texels; CreateFramebuffer's default
+        // GL_LINEAR would blur the very pixels the shader is trying to make visible.
+        glBindTexture(GL_TEXTURE_2D, mFrameBuffers[mPostDownsampleFb].clrbuf);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        if (mLastActiveTexture >= 0 && mLastActiveTexture < SHADER_MAX_TEXTURES) {
+            mLastBoundTextures[mLastActiveTexture] = 0;
+        }
+    }
+    if (mPostOutputFb < 0) {
+        mPostOutputFb = CreateFramebuffer();
+    }
+#if defined(__APPLE__) || defined(USE_OPENGLES)
+    if (mPostVao == 0) {
+        glGenVertexArrays(1, &mPostVao);
+    }
+#endif
+
+    // The downsample target stores bottom-up to match the D3D11 post convention: custom shaders
+    // (e.g. satpixie-crt.glsl) sample with `uv.y = 1.0 - vUV.y` assuming a Y-flipped source.
+    // The output target stays top-down because the built-in/custom fragment shaders flip on read.
+    UpdateFramebufferParameters(mPostDownsampleFb, nativeW, nativeH, 1, false, true, false, false);
+    UpdateFramebufferParameters(mPostOutputFb, outW, outH, 1, true, true, false, false);
+
+    // Disabled for blit, as in ResolveMSAAColorBuffer.
+    if (mLastScissorEnabled != 0) {
+        mLastScissorEnabled = 0;
+        glDisable(GL_SCISSOR_TEST);
+    }
+
+    // Step 1: GL_LINEAR downsample of the rendered frame to native resolution. The destination
+    // is bottom-up, so a top-down source must be swapped; a bottom-up source copies straight.
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, src.fbo);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, mFrameBuffers[mPostDownsampleFb].fbo);
+    GLint dstY0 = 0, dstY1 = (GLint)nativeH;
+    if (src.invertY) {
+        std::swap(dstY0, dstY1);
+    }
+    glBlitFramebuffer(0, 0, src.width, src.height, 0, dstY0, (GLint)nativeW, dstY1, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+
+    // Step 2: fullscreen triangle through the post shader into the output target. All GL state
+    // this touches is saved and restored, because the interpreter's caches (mLastLoadedShader,
+    // mLastActiveTexture, ...) only stay valid while the GL state matches what they recorded.
+    GLint prevProgram = 0;
+    glGetIntegerv(GL_CURRENT_PROGRAM, &prevProgram);
+    GLint prevViewport[4];
+    glGetIntegerv(GL_VIEWPORT, prevViewport);
+    GLint prevActiveTexture = 0;
+    glGetIntegerv(GL_ACTIVE_TEXTURE, &prevActiveTexture);
+    glActiveTexture(GL_TEXTURE0);
+    GLint prevBoundTexture = 0;
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevBoundTexture);
+    const GLboolean blendWasEnabled = glIsEnabled(GL_BLEND);
+#if defined(__APPLE__) || defined(USE_OPENGLES)
+    GLint prevVao = 0;
+    glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &prevVao);
+    glBindVertexArray(mPostVao);
+#endif
+
+    GdxLogPostShaderInfo(fmt::format("apply: custom='{}' mode={} {}x{} -> {}x{}",
+                                      customStem != nullptr ? customStem : "", mode, nativeW, nativeH, outW, outH));
+
+    glBindFramebuffer(GL_FRAMEBUFFER, mFrameBuffers[mPostOutputFb].fbo);
+    glViewport(0, 0, (GLint)outW, (GLint)outH);
+    if (blendWasEnabled) {
+        glDisable(GL_BLEND);
+    }
+    glUseProgram(prg->program);
+    glBindTexture(GL_TEXTURE_2D, mFrameBuffers[mPostDownsampleFb].clrbuf);
+    glUniform2f(prg->srcSizeLocation, (float)nativeW, (float)nativeH);
+    glUniform2f(prg->outSizeLocation, (float)outW, (float)outH);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+
+    glUseProgram((GLuint)prevProgram);
+    glViewport(prevViewport[0], prevViewport[1], prevViewport[2], prevViewport[3]);
+    if (blendWasEnabled) {
+        glEnable(GL_BLEND);
+    }
+    glBindTexture(GL_TEXTURE_2D, (GLuint)prevBoundTexture);
+    glActiveTexture((GLenum)prevActiveTexture);
+#if defined(__APPLE__) || defined(USE_OPENGLES)
+    glBindVertexArray((GLuint)prevVao);
+#endif
+
+    glBindFramebuffer(GL_FRAMEBUFFER, mFrameBuffers[mCurrentFrameBuffer].fbo);
+    if (mLastScissorEnabled != 1) {
+        mLastScissorEnabled = 1;
+        glEnable(GL_SCISSOR_TEST);
+    }
+
+    return (uintptr_t)mFrameBuffers[mPostOutputFb].clrbuf;
+}
+
+// Prefer a .slang pass (translated via glslang+SPIRV-Cross); fall back to the
+// backend's native .glsl single-file contract so mixed chains work.
+static std::filesystem::path GdxResolvePipelineShaderPathOGL(const std::filesystem::path& presetDir,
+                                                           const std::string& stem) {
+    // lexically_normal: pack presets carry ".." chains that can push the joined
+    // path past MAX_PATH even when the real target is short.
+    std::filesystem::path slangPath = (presetDir / (stem + ".slang")).lexically_normal();
+    if (std::filesystem::exists(slangPath)) {
+        return slangPath;
+    }
+    return (presetDir / (stem + ".glsl")).lexically_normal();
+}
+
+// Worker-thread half of the GL pipeline build: file reads and slang translation only. GL program
+// compilation must stay on the render thread (no GL context is current anywhere else).
+static void GdxBuildPostPipelineWorkerOGL(std::shared_ptr<GdxPostPipelineBuildOGL> build,
+                                          GdxPostShaderPipeline pipeline) {
+    const std::filesystem::path presetDir = pipeline.presetPath.parent_path();
+    build->passes.resize(pipeline.passes.size());
+    for (size_t i = 0; i < pipeline.passes.size(); ++i) {
+        if (build->cancel.load()) {
+            return;
+        }
+        GdxPostPassBuildOGL& pass = build->passes[i];
+        const std::filesystem::path shaderPath = GdxResolvePipelineShaderPathOGL(presetDir, pipeline.passes[i].shader);
+        pass.cacheKey = shaderPath.string();
+        try {
+            pass.mtime = static_cast<uint64_t>(std::filesystem::last_write_time(shaderPath).time_since_epoch().count());
+        } catch (...) {
+            SPDLOG_ERROR("Pipeline pass shader not found: {}", shaderPath.string());
+            build->state = 2;
+            return;
+        }
+        if (shaderPath.extension() == ".slang") {
+            GdxSlangTranslation trans;
+            try {
+                trans = GdxTranslateSlangFile(shaderPath, GdxSlangTarget::Glsl330);
+            } catch (const std::exception& e) {
+                SPDLOG_ERROR("Slang translation threw for {}: {}", shaderPath.string(), e.what());
+                build->state = 2;
+                return;
+            } catch (...) {
+                SPDLOG_ERROR("Slang translation threw for {}", shaderPath.string());
+                build->state = 2;
+                return;
+            }
+            GdxDumpSlangTranslation(shaderPath, GdxSlangTarget::Glsl330, trans.source);
+            if (trans.hasVertexStage) {
+                GdxDumpSlangTranslation(shaderPath.parent_path() / (shaderPath.stem().string() + "-vs.slang"),
+                                        GdxSlangTarget::Glsl330, trans.vertexSource);
+            }
+            if (!trans.ok) {
+                SPDLOG_ERROR("Slang translation failed for {}: {}", shaderPath.string(), trans.error);
+                build->state = 2;
+                return;
+            }
+            pass.isSlang = true;
+            pass.slangParameters = std::move(trans.parameters);
+            pass.slangUsedBuiltins = std::move(trans.usedBuiltins);
+            pass.vsSource = trans.hasVertexStage ? std::move(trans.vertexSource) : std::string(sGdxPostVsSource330);
+            pass.fsSource = std::move(trans.source);
+        } else {
+            std::string userBody = GdxReadShaderFile(shaderPath);
+            if (userBody.empty()) {
+                SPDLOG_ERROR("Pipeline pass shader is empty or could not be read: {}", shaderPath.string());
+                build->state = 2;
+                return;
+            }
+            pass.vsSource = sGdxPostVsSource;
+            pass.fsSource = GdxBuildCustomPostFsSource(userBody);
+        }
+        pass.ok = true;
+    }
+    build->state = 1;
+}
+
+// Render-thread half: compile the translated sources and resolve uniforms/samplers.
+bool GdxInstallPostPipelineBuildOGL(GfxRenderingAPIOGL* self, GdxPostPipelineBuildOGL* build) {
+    for (GdxPostPassBuildOGL& pass : build->passes) {
+        GfxRenderingAPIOGL::PostShaderProgramOGL prg = {};
+        prg.attempted = true;
+        prg.mtime = pass.mtime;
+        prg.isSlang = pass.isSlang;
+        prg.slangParameters = std::move(pass.slangParameters);
+        prg.slangUsedBuiltins = std::move(pass.slangUsedBuiltins);
+        prg.program = GdxCompilePostProgram(pass.vsSource.c_str(), pass.fsSource.c_str());
+        if (prg.program == 0) {
+            SPDLOG_ERROR("Pipeline pass shader compile failed: {}", pass.cacheKey);
+            self->mPostPipelineProgramCache[pass.cacheKey] = std::move(prg);
+            return false;
+        }
+        self->GdxInitPostProgramOGL(&prg);
+        self->mPostPipelineProgramCache[pass.cacheKey] = std::move(prg);
+    }
+    return true;
+}
+
+bool GdxCompilePipelinePassOGL(const std::filesystem::path& path, GfxRenderingAPIOGL* self,
+                               GfxRenderingAPIOGL::PostShaderProgramOGL* outPrg) {
+    outPrg->isSlang = false;
+    outPrg->slangParameters.clear();
+    outPrg->slangParameterLocations.clear();
+    outPrg->slangUsedBuiltins = {};
+    outPrg->slangSamplerLocations.clear();
+    outPrg->slangExtraSizeLocations.clear();
+
+    const bool isSlang = path.extension() == ".slang";
+    if (isSlang) {
+        // glslang/SPIRV-Cross throw on pathological inputs (Mega_Bezel-scale chains);
+        // a failed pass must fall back to the unfiltered image, never crash the game.
+        GdxSlangTranslation trans;
+        try {
+            trans = GdxTranslateSlangFile(path, GdxSlangTarget::Glsl330);
+        } catch (const std::exception& e) {
+            SPDLOG_ERROR("Slang translation threw for {}: {}", path.string(), e.what());
+            return false;
+        } catch (...) {
+            SPDLOG_ERROR("Slang translation threw for {}", path.string());
+            return false;
+        }
+        GdxDumpSlangTranslation(path, GdxSlangTarget::Glsl330, trans.source);
+        if (trans.hasVertexStage) {
+            GdxDumpSlangTranslation(path.parent_path() / (path.stem().string() + "-vs.slang"), GdxSlangTarget::Glsl330,
+                                    trans.vertexSource);
+        }
+        if (!trans.ok) {
+            SPDLOG_ERROR("Slang translation failed for {}: {}", path.string(), trans.error);
+            return false;
+        }
+        outPrg->program = trans.hasVertexStage ? GdxCompilePostProgram(trans.vertexSource.c_str(), trans.source.c_str())
+                                               : GdxCompilePostProgram(sGdxPostVsSource330, trans.source.c_str());
+        if (outPrg->program == 0) {
+            SPDLOG_ERROR("Translated slang compile failed: {}", path.string());
+            return false;
+        }
+        outPrg->isSlang = true;
+        outPrg->slangParameters = std::move(trans.parameters);
+        outPrg->slangUsedBuiltins = std::move(trans.usedBuiltins);
+        self->GdxInitPostProgramOGL(outPrg);
+        return true;
+    }
+
+    std::string userBody = GdxReadShaderFile(path);
+    if (userBody.empty()) {
+        SPDLOG_ERROR("Pipeline pass shader is empty or could not be read: {}", path.string());
+        return false;
+    }
+    std::string fsSource = GdxBuildCustomPostFsSource(userBody);
+    outPrg->program = GdxCompilePostProgram(sGdxPostVsSource, fsSource.c_str());
+    if (outPrg->program == 0) {
+        SPDLOG_ERROR("Pipeline pass shader compile failed: {}", path.string());
+        return false;
+    }
+    self->GdxInitPostProgramOGL(outPrg);
+    return true;
+}
+
+static GLenum GdxPipelineWrapModeOGL(GdxPostPassDesc::WrapMode mode) {
+    switch (mode) {
+        case GdxPostPassDesc::WrapMode::ClampToBorder:
+            return GL_CLAMP_TO_BORDER;
+        case GdxPostPassDesc::WrapMode::Repeat:
+            return GL_REPEAT;
+        case GdxPostPassDesc::WrapMode::MirroredRepeat:
+            return GL_MIRRORED_REPEAT;
+        case GdxPostPassDesc::WrapMode::ClampToEdge:
+        default:
+            return GL_CLAMP_TO_EDGE;
+    }
+}
+
+static GdxFramebufferFormat GdxPipelineFramebufferFormat(const GdxPostPassDesc& pass) {
+    if (pass.floatFramebuffer) {
+        return GdxFramebufferFormat::R16G16B16A16_FLOAT;
+    }
+    if (pass.srgbFramebuffer) {
+        return GdxFramebufferFormat::R8G8B8A8_UNORM_SRGB;
+    }
+    return GdxFramebufferFormat::R8G8B8A8_UNORM;
+}
+
+// Load the pipeline's LUT textures into OpenGL textures. Returns false and logs
+// on failure; missing files are tolerated (the shader just samples black).
+bool GdxLoadPipelineLutsOGL(const GdxPostShaderPipeline& pipeline, std::vector<GLuint>* outTextures,
+                            std::vector<std::filesystem::path>* outPaths,
+                            std::vector<std::pair<uint32_t, uint32_t>>* outSizes) {
+    const std::filesystem::path presetDir = pipeline.presetPath.parent_path();
+
+    outTextures->clear();
+    outPaths->clear();
+    outSizes->clear();
+    outTextures->reserve(pipeline.textureOrder.size());
+    outPaths->reserve(pipeline.textureOrder.size());
+    outSizes->reserve(pipeline.textureOrder.size());
+
+    for (const std::string& name : pipeline.textureOrder) {
+        auto it = pipeline.textures.find(name);
+        if (it == pipeline.textures.end()) {
+            outTextures->push_back(0);
+            outPaths->push_back(std::filesystem::path());
+            outSizes->push_back({ 0, 0 });
+            continue;
+        }
+
+        std::filesystem::path imagePath = (presetDir / it->second.path).lexically_normal();
+        outPaths->push_back(imagePath);
+
+        int w = 0, h = 0, channels = 0;
+        stbi_uc* pixels = stbi_load(imagePath.string().c_str(), &w, &h, &channels, 4);
+        if (pixels == nullptr) {
+            SPDLOG_WARN("Could not load LUT texture '{}': {}", imagePath.string(), stbi_failure_reason());
+            outTextures->push_back(0);
+            outSizes->push_back({ 0, 0 });
+            continue;
+        }
+
+        GLuint tex = 0;
+        glGenTextures(1, &tex);
+        glBindTexture(GL_TEXTURE_2D, tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, it->second.linear ? GL_LINEAR : GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, it->second.linear ? GL_LINEAR : GL_NEAREST);
+        const GLenum wrap = GdxPipelineWrapModeOGL(it->second.wrap);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wrap);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wrap);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        stbi_image_free(pixels);
+
+        outTextures->push_back(tex);
+        outSizes->push_back({ static_cast<uint32_t>(w), static_cast<uint32_t>(h) });
+    }
+    return true;
+}
+
+GdxSlangUsedBuiltins GdxUnionUsedBuiltins(const std::vector<GfxRenderingAPIOGL::PostShaderProgramOGL*>& programs) {
+    GdxSlangUsedBuiltins result;
+    for (const GfxRenderingAPIOGL::PostShaderProgramOGL* prg : programs) {
+        result.maxOriginalHistory = std::max(result.maxOriginalHistory, prg->slangUsedBuiltins.maxOriginalHistory);
+        result.passOutputIndices.insert(prg->slangUsedBuiltins.passOutputIndices.begin(),
+                                        prg->slangUsedBuiltins.passOutputIndices.end());
+        result.passFeedbackIndices.insert(prg->slangUsedBuiltins.passFeedbackIndices.begin(),
+                                          prg->slangUsedBuiltins.passFeedbackIndices.end());
+        result.userTextureIndices.insert(prg->slangUsedBuiltins.userTextureIndices.begin(),
+                                         prg->slangUsedBuiltins.userTextureIndices.end());
+    }
+    return result;
+}
+
+// `<Alias>` / `<Alias>Feedback` named samplers and `<Alias>Size` uniforms refer
+// to passes by their `aliasN =` key; resolve the name to a pass index.
+static int GdxFindPipelinePassByAlias(const GdxPostShaderPipeline& pipeline, const std::string& alias) {
+    for (size_t i = 0; i < pipeline.passes.size(); ++i) {
+        if (!pipeline.passes[i].alias.empty() && pipeline.passes[i].alias == alias) {
+            return static_cast<int>(i);
+        }
+    }
+    return -1;
+}
+
+uintptr_t GfxRenderingAPIOGL::ApplyPostShaderChain(int srcFbId, const GdxPostShaderPipeline& pipeline,
+                                                   uint32_t nativeW, uint32_t nativeH, uint32_t outW, uint32_t outH) {
+    if (srcFbId <= 0 || srcFbId >= (int)mFrameBuffers.size() || nativeW == 0 || nativeH == 0 || outW == 0 ||
+        outH == 0 || pipeline.passes.empty()) {
+        return 0;
+    }
+
+    const std::filesystem::path presetDir = pipeline.presetPath.parent_path();
+
+    // Async pipeline build: the preset key includes the folded pass mtimes, so any disk edit
+    // retriggers a rebuild. While a build runs we publish the unfiltered frame; a failed build is
+    // latched so it is not retried every frame.
+    const std::string chainKey = pipeline.presetPath.generic_string() + "#" + std::to_string(pipeline.mtime);
+    if (chainKey != mPostPipelineReadyKey) {
+        if (chainKey == mPostPipelineFailedKey) {
+            return 0;
+        }
+        if (mPostPipelineBuild != nullptr && mPostPipelineBuild->key == chainKey) {
+            const int state = mPostPipelineBuild->state.load();
+            if (state == 0) {
+                return 0;
+            }
+            if (state == 2 || !GdxInstallPostPipelineBuildOGL(this, mPostPipelineBuild.get())) {
+                mPostPipelineFailedKey = chainKey;
+                mPostPipelineBuild.reset();
+                return 0;
+            }
+            mPostPipelineBuild.reset();
+            mPostPipelineReadyKey = chainKey;
+        } else {
+            bool allCached = true;
+            for (size_t i = 0; i < pipeline.passes.size(); ++i) {
+                const std::filesystem::path sp = GdxResolvePipelineShaderPathOGL(presetDir, pipeline.passes[i].shader);
+                uint64_t mt = 0;
+                try {
+                    mt = static_cast<uint64_t>(std::filesystem::last_write_time(sp).time_since_epoch().count());
+                } catch (...) {
+                    allCached = false;
+                    break;
+                }
+                auto it = mPostPipelineProgramCache.find(sp.string());
+                if (it == mPostPipelineProgramCache.end() || it->second.mtime != mt || it->second.program == 0) {
+                    allCached = false;
+                    break;
+                }
+            }
+            if (allCached) {
+                mPostPipelineReadyKey = chainKey;
+                mPostPipelineFailedKey.clear();
+            } else {
+                if (mPostPipelineBuild != nullptr) {
+                    mPostPipelineBuild->cancel = true;
+                }
+                auto build = std::make_shared<GdxPostPipelineBuildOGL>();
+                build->key = chainKey;
+                std::thread(GdxBuildPostPipelineWorkerOGL, build, pipeline).detach();
+                mPostPipelineBuild = std::move(build);
+                return 0;
+            }
+        }
+    }
+
+    // Compile (or retrieve cached) programs for every pass. The cache key is the full shader path
+    // so the same pass file reused across presets still reloads correctly when its mtime changes.
+    std::vector<PostShaderProgramOGL*> programs;
+    programs.reserve(pipeline.passes.size());
+    for (size_t i = 0; i < pipeline.passes.size(); ++i) {
+        const std::string& shaderStem = pipeline.passes[i].shader;
+        const std::filesystem::path shaderPath = GdxResolvePipelineShaderPathOGL(presetDir, shaderStem);
+        const std::string cacheKey = shaderPath.string();
+
+        uint64_t mtimeTicks = 0;
+        try {
+            mtimeTicks = static_cast<uint64_t>(std::filesystem::last_write_time(shaderPath).time_since_epoch().count());
+        } catch (...) {
+            SPDLOG_ERROR("Pipeline pass shader not found: {}", shaderPath.string());
+            return 0;
+        }
+
+        auto it = mPostPipelineProgramCache.find(cacheKey);
+        if (it == mPostPipelineProgramCache.end() || it->second.mtime != mtimeTicks) {
+            PostShaderProgramOGL prg = {};
+            prg.attempted = true;
+            prg.mtime = mtimeTicks;
+            if (!GdxCompilePipelinePassOGL(shaderPath, this, &prg)) {
+                mPostPipelineProgramCache[cacheKey] = std::move(prg);
+                return 0;
+            }
+            mPostPipelineProgramCache[cacheKey] = std::move(prg);
+            it = mPostPipelineProgramCache.find(cacheKey);
+        }
+        if (it->second.program == 0) {
+            return 0;
+        }
+        programs.push_back(&it->second);
+    }
+
+    const GdxSlangUsedBuiltins used = GdxUnionUsedBuiltins(programs);
+    const size_t historySize = used.maxOriginalHistory >= 0 ? static_cast<size_t>(used.maxOriginalHistory + 1) : 0;
+
+    // Allocate N+1 framebuffers: [0] is the first-pass input (bottom-up, native size), [1..N-1]
+    // are intermediate pass outputs (bottom-up), and [N] is the final pass output (top-down).
+    const size_t neededFbs = pipeline.passes.size() + 1;
+    while (mPostPipelineFbs.size() < neededFbs) {
+        mPostPipelineFbs.push_back(CreateFramebuffer());
+    }
+
+    // Allocate history ring buffers if any pass references OriginalHistoryN.
+    while (mPostPipelineHistoryFbs.size() < historySize) {
+        mPostPipelineHistoryFbs.push_back(CreateFramebuffer());
+    }
+
+    // Allocate one feedback framebuffer per pass that feeds back. The preset's
+    // feedback_pass flag is one source; a pass is also fed back when any shader
+    // samples PassFeedbackN or an `<Alias>Feedback` named sampler (Mega_Bezel
+    // uses the latter without ever setting the flag).
+    if (mPostPipelineFeedbackFbs.size() < pipeline.passes.size()) {
+        mPostPipelineFeedbackFbs.resize(pipeline.passes.size(), -1);
+    }
+    std::set<int> feedbackNeeded;
+    for (size_t i = 0; i < pipeline.passes.size(); ++i) {
+        if (pipeline.passes[i].feedbackPass) {
+            feedbackNeeded.insert(static_cast<int>(i));
+        }
+    }
+    for (const PostShaderProgramOGL* prg : programs) {
+        feedbackNeeded.insert(prg->slangUsedBuiltins.passFeedbackIndices.begin(),
+                              prg->slangUsedBuiltins.passFeedbackIndices.end());
+        for (const std::string& samplerName : prg->slangUsedBuiltins.namedSamplers) {
+            if (samplerName.size() > 8 && samplerName.compare(samplerName.size() - 8, 8, "Feedback") == 0) {
+                const int passIdx =
+                    GdxFindPipelinePassByAlias(pipeline, samplerName.substr(0, samplerName.size() - 8));
+                if (passIdx >= 0) {
+                    feedbackNeeded.insert(passIdx);
+                }
+            }
+        }
+    }
+    for (int i : feedbackNeeded) {
+        if (i >= 0 && i < (int)pipeline.passes.size() && mPostPipelineFeedbackFbs[i] < 0) {
+            mPostPipelineFeedbackFbs[i] = CreateFramebuffer();
+        }
+    }
+
+    // Load LUT textures if the pipeline's LUT set changed. A change in order or
+    // path triggers a reload; everything else reuses the existing GPU textures.
+    bool lutsChanged = mPostPipelineLutTextures.size() != pipeline.textureOrder.size();
+    if (!lutsChanged) {
+        for (size_t i = 0; i < pipeline.textureOrder.size(); ++i) {
+            auto it = pipeline.textures.find(pipeline.textureOrder[i]);
+            std::filesystem::path expectedPath;
+            if (it != pipeline.textures.end()) {
+                expectedPath = presetDir / it->second.path;
+            }
+            if (mPostPipelineLutPaths[i] != expectedPath) {
+                lutsChanged = true;
+                break;
+            }
+        }
+    }
+    if (lutsChanged) {
+        for (GLuint tex : mPostPipelineLutTextures) {
+            if (tex != 0) {
+                glDeleteTextures(1, &tex);
+            }
+        }
+        GdxLoadPipelineLutsOGL(pipeline, &mPostPipelineLutTextures, &mPostPipelineLutPaths, &mPostPipelineLutSizes);
+    }
+
+#if defined(__APPLE__) || defined(USE_OPENGLES)
+    if (mPostVao == 0) {
+        glGenVertexArrays(1, &mPostVao);
+    }
+#endif
+
+    // Save GL state that the pass draw will touch.
+    GLint prevProgram = 0;
+    glGetIntegerv(GL_CURRENT_PROGRAM, &prevProgram);
+    GLint prevViewport[4];
+    glGetIntegerv(GL_VIEWPORT, prevViewport);
+    GLint prevActiveTexture = 0;
+    glGetIntegerv(GL_ACTIVE_TEXTURE, &prevActiveTexture);
+    glActiveTexture(GL_TEXTURE0);
+    GLint prevBoundTexture = 0;
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevBoundTexture);
+    const GLboolean blendWasEnabled = glIsEnabled(GL_BLEND);
+#if defined(__APPLE__) || defined(USE_OPENGLES)
+    GLint prevVao = 0;
+    glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &prevVao);
+    glBindVertexArray(mPostVao);
+#endif
+    if (mLastScissorEnabled != 0) {
+        mLastScissorEnabled = 0;
+        glDisable(GL_SCISSOR_TEST);
+    }
+
+    // The pass chain runs top-down end to end, matching D3D11: translated slang passes sample
+    // with the vUV varying directly, so a bottom-up first input renders every chain upside down
+    // on GL. FB0 is top-down like the game FB; the blit flips only when the source is bottom-up.
+    UpdateFramebufferParameters(mPostPipelineFbs[0], nativeW, nativeH, 1, true, true, false, false,
+                                GdxFramebufferFormat::R8G8B8A8_UNORM);
+    {
+        const FramebufferOGL& src = mFrameBuffers[srcFbId];
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, src.fbo);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, mFrameBuffers[mPostPipelineFbs[0]].fbo);
+        GLint dstY0 = 0, dstY1 = (GLint)nativeH;
+        if (!src.invertY) {
+            std::swap(dstY0, dstY1);
+        }
+        glBlitFramebuffer(0, 0, src.width, src.height, 0, dstY0, (GLint)nativeW, dstY1, GL_COLOR_BUFFER_BIT,
+                          GL_LINEAR);
+    }
+
+    // Snapshot the current source frame into the history ring before the passes run.
+    if (historySize > 0) {
+        const int historyFb = mPostPipelineHistoryFbs[mPostPipelineHistoryIndex % historySize];
+        UpdateFramebufferParameters(historyFb, nativeW, nativeH, 1, true, true, false, false,
+                                    GdxFramebufferFormat::R8G8B8A8_UNORM);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, mFrameBuffers[mPostPipelineFbs[0]].fbo);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, mFrameBuffers[historyFb].fbo);
+        glBlitFramebuffer(0, 0, (GLint)nativeW, (GLint)nativeH, 0, 0, (GLint)nativeW, (GLint)nativeH,
+                          GL_COLOR_BUFFER_BIT, GL_LINEAR);
+        ++mPostPipelineHistoryIndex;
+    }
+
+    auto bindSamplerOGL = [&](int unit, GLuint tex, bool linear, GdxPostPassDesc::WrapMode wrapS,
+                              GdxPostPassDesc::WrapMode wrapT) {
+        glActiveTexture(GL_TEXTURE0 + unit);
+        glBindTexture(GL_TEXTURE_2D, tex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, linear ? GL_LINEAR : GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, linear ? GL_LINEAR : GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GdxPipelineWrapModeOGL(wrapS));
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GdxPipelineWrapModeOGL(wrapT));
+    };
+
+    // Run the pass chain. Each pass samples its input as bottom-up and writes to a bottom-up
+    // output, except the final pass which writes top-down so DrawGame presents it correctly.
+    // Output sizes are deterministic from the scale chain, so precompute them all:
+    // PassOutputNSize / `<Alias>Size` can reference a pass that runs later.
+    std::vector<std::pair<uint32_t, uint32_t>> passOutSizes(pipeline.passes.size());
+    {
+        uint32_t chainW = nativeW, chainH = nativeH;
+        for (size_t i = 0; i < pipeline.passes.size(); ++i) {
+            const GdxPostPassDesc& pass = pipeline.passes[i];
+            const bool isLast = (i + 1 == pipeline.passes.size());
+            const uint32_t dw = isLast ? outW : GdxResolvePostPassScale(pass.scaleTypeX, pass.scaleX, chainW, outW);
+            const uint32_t dh = isLast ? outH : GdxResolvePostPassScale(pass.scaleTypeY, pass.scaleY, chainH, outH);
+            passOutSizes[i] = { dw, dh };
+            chainW = dw;
+            chainH = dh;
+        }
+    }
+
+    uint32_t srcW = nativeW;
+    uint32_t srcH = nativeH;
+    int srcFb = mPostPipelineFbs[0];
+
+    for (size_t i = 0; i < pipeline.passes.size(); ++i) {
+        const GdxPostPassDesc& pass = pipeline.passes[i];
+        const uint32_t dstW = passOutSizes[i].first;
+        const uint32_t dstH = passOutSizes[i].second;
+        const int dstFb = (int)mPostPipelineFbs[i + 1];
+
+        const bool shouldSkip = pass.frameCountMod != 0 && (mFrameCount % pass.frameCountMod) != 0;
+
+        if (!shouldSkip) {
+            UpdateFramebufferParameters(dstFb, dstW, dstH, 1, true, true, false, false,
+                                        GdxPipelineFramebufferFormat(pass));
+        }
+
+        if (!shouldSkip) {
+            // Primary source sampler.
+            bindSamplerOGL(0, mFrameBuffers[srcFb].clrbuf, pass.filterLinear, pass.wrapS, pass.wrapT);
+
+            // OriginalHistoryN: previous N source frames, oldest first.
+            for (int n = 0; n <= programs[i]->slangUsedBuiltins.maxOriginalHistory; ++n) {
+                const size_t idx = (mPostPipelineHistoryIndex - 1 - n + historySize) % historySize;
+                const int histFb = mPostPipelineHistoryFbs[idx];
+                bindSamplerOGL(GdxSlangTextureBindings::OriginalHistory(n), mFrameBuffers[histFb].clrbuf, true,
+                               GdxPostPassDesc::WrapMode::ClampToEdge, GdxPostPassDesc::WrapMode::ClampToEdge);
+            }
+
+            // PassOutputN: same-frame output of pass N.
+            for (int n : programs[i]->slangUsedBuiltins.passOutputIndices) {
+                if (n >= 0 && n < (int)mPostPipelineFbs.size() - 1) {
+                    const int outFb = mPostPipelineFbs[n + 1];
+                    bindSamplerOGL(GdxSlangTextureBindings::PassOutput(n), mFrameBuffers[outFb].clrbuf, true,
+                                   GdxPostPassDesc::WrapMode::ClampToEdge, GdxPostPassDesc::WrapMode::ClampToEdge);
+                }
+            }
+
+            // PassFeedbackN: previous frame's output of pass N.
+            for (int n : programs[i]->slangUsedBuiltins.passFeedbackIndices) {
+                if (n >= 0 && n < (int)mPostPipelineFeedbackFbs.size() && mPostPipelineFeedbackFbs[n] >= 0) {
+                    const int fbFb = mPostPipelineFeedbackFbs[n];
+                    bindSamplerOGL(GdxSlangTextureBindings::PassFeedback(n), mFrameBuffers[fbFb].clrbuf, true,
+                                   GdxPostPassDesc::WrapMode::ClampToEdge, GdxPostPassDesc::WrapMode::ClampToEdge);
+                }
+            }
+
+            // UserN: LUT textures declared in the preset.
+            for (int n : programs[i]->slangUsedBuiltins.userTextureIndices) {
+                if (n >= 0 && n < (int)mPostPipelineLutTextures.size() && mPostPipelineLutTextures[n] != 0) {
+                    auto it = pipeline.textures.find(pipeline.textureOrder[n]);
+                    bool linear = true;
+                    GdxPostPassDesc::WrapMode wrap = GdxPostPassDesc::WrapMode::ClampToEdge;
+                    if (it != pipeline.textures.end()) {
+                        linear = it->second.linear;
+                        wrap = it->second.wrap;
+                    }
+                    bindSamplerOGL(GdxSlangTextureBindings::User(n), mPostPipelineLutTextures[n], linear, wrap, wrap);
+                }
+            }
+
+            // Named samplers: a preset LUT when the name is a `textures` entry,
+            // `<Alias>` for that pass's current-frame output, `<Alias>Feedback`
+            // for its previous frame.
+            for (size_t k = 0; k < programs[i]->slangUsedBuiltins.namedSamplers.size(); ++k) {
+                const std::string& samplerName = programs[i]->slangUsedBuiltins.namedSamplers[k];
+                auto texIt = pipeline.textures.find(samplerName);
+                if (texIt != pipeline.textures.end()) {
+                    const auto orderIt =
+                        std::find(pipeline.textureOrder.begin(), pipeline.textureOrder.end(), samplerName);
+                    const size_t lutIdx = static_cast<size_t>(orderIt - pipeline.textureOrder.begin());
+                    if (orderIt != pipeline.textureOrder.end() && lutIdx < mPostPipelineLutTextures.size() &&
+                        mPostPipelineLutTextures[lutIdx] != 0) {
+                        bindSamplerOGL(GdxSlangTextureBindings::Named(static_cast<int>(k)),
+                                       mPostPipelineLutTextures[lutIdx], texIt->second.linear, texIt->second.wrap,
+                                       texIt->second.wrap);
+                    }
+                } else {
+                    std::string alias = samplerName;
+                    bool wantsFeedback = false;
+                    if (alias.size() > 8 && alias.compare(alias.size() - 8, 8, "Feedback") == 0) {
+                        wantsFeedback = true;
+                        alias = alias.substr(0, alias.size() - 8);
+                    }
+                    const int passIdx = GdxFindPipelinePassByAlias(pipeline, alias);
+                    int fb = -1;
+                    if (passIdx >= 0) {
+                        if (wantsFeedback) {
+                            if (passIdx < (int)mPostPipelineFeedbackFbs.size()) {
+                                fb = mPostPipelineFeedbackFbs[passIdx];
+                            }
+                        } else if (passIdx + 1 < (int)mPostPipelineFbs.size()) {
+                            fb = mPostPipelineFbs[passIdx + 1];
+                        }
+                    }
+                    if (fb >= 0) {
+                        bindSamplerOGL(GdxSlangTextureBindings::Named(static_cast<int>(k)),
+                                       mFrameBuffers[fb].clrbuf, true, GdxPostPassDesc::WrapMode::ClampToEdge,
+                                       GdxPostPassDesc::WrapMode::ClampToEdge);
+                    }
+                }
+            }
+
+            glActiveTexture(GL_TEXTURE0);
+        }
+
+        if (!shouldSkip) {
+            glBindFramebuffer(GL_FRAMEBUFFER, mFrameBuffers[dstFb].fbo);
+            glViewport(0, 0, (GLint)dstW, (GLint)dstH);
+            if (blendWasEnabled) {
+                glDisable(GL_BLEND);
+            }
+            glUseProgram(programs[i]->program);
+            glBindTexture(GL_TEXTURE_2D, mFrameBuffers[srcFb].clrbuf);
+            if (programs[i]->isSlang) {
+                // Slang sizes follow the vec4 convention: xy = size, zw = 1/size.
+                glUniform4f(programs[i]->srcSizeLocation, (float)srcW, (float)srcH, 1.0f / (float)srcW,
+                            1.0f / (float)srcH);
+                glUniform4f(programs[i]->outSizeLocation, (float)dstW, (float)dstH, 1.0f / (float)dstW,
+                            1.0f / (float)dstH);
+            } else {
+                glUniform2f(programs[i]->srcSizeLocation, (float)srcW, (float)srcH);
+                glUniform2f(programs[i]->outSizeLocation, (float)dstW, (float)dstH);
+            }
+            if (programs[i]->isSlang) {
+                if (programs[i]->slangFrameCountLocation >= 0) {
+                    glUniform1ui(programs[i]->slangFrameCountLocation, mFrameCount);
+                }
+                if (programs[i]->slangMvpLocation >= 0) {
+                    const float identity[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
+                    glUniformMatrix4fv(programs[i]->slangMvpLocation, 1, GL_FALSE, identity);
+                }
+                // Resolve effective parameter value: CVar > .slangp override > default.
+                const std::string presetStem = GdxPostShaderCvarStem(
+                    std::filesystem::path(Ship::Context::GetAppDirectoryPath()) / "shaders", pipeline.presetPath);
+                for (const GdxSlangParameter& p : programs[i]->slangParameters) {
+                    auto locIt = programs[i]->slangParameterLocations.find(p.name);
+                    if (locIt == programs[i]->slangParameterLocations.end() || locIt->second < 0) {
+                        continue;
+                    }
+                    float value = p.defaultValue;
+                    auto overrideIt = pipeline.parameterOverrides.find(p.name);
+                    if (overrideIt != pipeline.parameterOverrides.end()) {
+                        value = overrideIt->second;
+                    }
+                    const std::string cvarName = "gEnhancements.Graphics.PipelineParam." + presetStem + "." + p.name;
+                    // The menu sliders write Float CVars; CVarGetString would return "" for them.
+                    if (CVarGet(cvarName.c_str()) != nullptr) {
+                        value = CVarGetFloat(cvarName.c_str(), p.defaultValue);
+                    }
+                    glUniform1f(locIt->second, value);
+                }
+                // `<Name>Size` vec4s, resolved against the same sources as the
+                // D3D11 cbuffer fill. History and unrecognized names fall back to
+                // the native source size.
+                static const std::regex passOutSizeRe(R"(^Pass(?:Output|Feedback)(\d+)Size$)");
+                static const std::regex userSizeRe(R"(^User(\d+)Size$)");
+                for (const auto& sizeEntry : programs[i]->slangExtraSizeLocations) {
+                    if (sizeEntry.second < 0) {
+                        continue;
+                    }
+                    const std::string& sizeName = sizeEntry.first;
+                    uint32_t sizeW = nativeW, sizeH = nativeH;
+                    std::smatch sizeMatch;
+                    if (std::regex_match(sizeName, sizeMatch, passOutSizeRe)) {
+                        const int n = std::atoi(sizeMatch[1].str().c_str());
+                        if (n >= 0 && n < (int)passOutSizes.size()) {
+                            sizeW = passOutSizes[n].first;
+                            sizeH = passOutSizes[n].second;
+                        }
+                    } else if (std::regex_match(sizeName, sizeMatch, userSizeRe)) {
+                        const int n = std::atoi(sizeMatch[1].str().c_str());
+                        if (n >= 0 && n < (int)mPostPipelineLutSizes.size() &&
+                            mPostPipelineLutSizes[n].first > 0) {
+                            sizeW = mPostPipelineLutSizes[n].first;
+                            sizeH = mPostPipelineLutSizes[n].second;
+                        }
+                    } else if (sizeName.size() > 4) {
+                        const int passIdx =
+                            GdxFindPipelinePassByAlias(pipeline, sizeName.substr(0, sizeName.size() - 4));
+                        if (passIdx >= 0) {
+                            sizeW = passOutSizes[passIdx].first;
+                            sizeH = passOutSizes[passIdx].second;
+                        }
+                    }
+                    glUniform4f(sizeEntry.second, (float)sizeW, (float)sizeH, 1.0f / (float)sizeW,
+                                1.0f / (float)sizeH);
+                }
+            }
+            glDrawArrays(GL_TRIANGLES, 0, 3);
+        }
+
+        srcFb = dstFb;
+        srcW = dstW;
+        srcH = dstH;
+
+        // If this pass feeds back, copy its output into the feedback framebuffer
+        // so PassFeedbackN / `<Alias>Feedback` samples last frame's result next
+        // frame. The framebuffer's existence is the trigger: it is allocated for
+        // every pass anything samples feedback from, flag or not.
+        if (i < mPostPipelineFeedbackFbs.size() && mPostPipelineFeedbackFbs[i] >= 0) {
+            const int fbFb = mPostPipelineFeedbackFbs[i];
+            UpdateFramebufferParameters(fbFb, dstW, dstH, 1, true, true, false, false,
+                                        GdxPipelineFramebufferFormat(pass));
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, mFrameBuffers[dstFb].fbo);
+            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, mFrameBuffers[fbFb].fbo);
+            glBlitFramebuffer(0, 0, (GLint)dstW, (GLint)dstH, 0, 0, (GLint)dstW, (GLint)dstH, GL_COLOR_BUFFER_BIT,
+                              GL_LINEAR);
+        }
+    }
+
+    // Restore state so the interpreter's caches stay consistent with the GL context.
+    glUseProgram((GLuint)prevProgram);
+    glViewport(prevViewport[0], prevViewport[1], prevViewport[2], prevViewport[3]);
+    if (blendWasEnabled) {
+        glEnable(GL_BLEND);
+    }
+    glBindTexture(GL_TEXTURE_2D, (GLuint)prevBoundTexture);
+    glActiveTexture((GLenum)prevActiveTexture);
+#if defined(__APPLE__) || defined(USE_OPENGLES)
+    glBindVertexArray((GLuint)prevVao);
+#endif
+
+    glBindFramebuffer(GL_FRAMEBUFFER, mFrameBuffers[mCurrentFrameBuffer].fbo);
+    if (mLastScissorEnabled != 1) {
+        mLastScissorEnabled = 1;
+        glEnable(GL_SCISSOR_TEST);
+    }
+
+    GdxLogPostShaderInfo(fmt::format("pipeline '{}': {} pass(es), {}x{} -> {}x{}", pipeline.presetPath.filename().string(),
+                                     pipeline.passes.size(), nativeW, nativeH, outW, outH));
+
+    return (uintptr_t)mFrameBuffers[mPostPipelineFbs[pipeline.passes.size()]].clrbuf;
 }
 
 void GfxRenderingAPIOGL::CopyFramebuffer(int fb_dst_id, int fb_src_id, int srcX0, int srcY0, int srcX1, int srcY1,
@@ -1276,7 +2468,11 @@ void GfxRenderingAPIOGL::CopyFramebuffer(int fb_dst_id, int fb_src_id, int srcX0
         glBindFramebuffer(GL_READ_FRAMEBUFFER, src.fbo);
         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fb_resolve.fbo);
 
-        glBlitFramebuffer(0, 0, src.width, src.height, 0, 0, src.width, src.height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        GLint dstY0 = 0, dstY1 = (GLint)src.height;
+        if (src.invertY != fb_resolve.invertY) {
+            std::swap(dstY0, dstY1);
+        }
+        glBlitFramebuffer(0, 0, src.width, src.height, 0, dstY0, src.width, dstY1, GL_COLOR_BUFFER_BIT, GL_NEAREST);
 
         // Switch source buffer to the resolved sample
         fb_src_id = fb_resolve_id;

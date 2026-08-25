@@ -24,6 +24,7 @@ class GfxWindowBackend {
     virtual bool GetMouseState(uint32_t btn) = 0;
     virtual void SetMouseCapture(bool capture) = 0;
     virtual bool IsMouseCaptured() = 0;
+    virtual void SetMouseGrab(bool grab) = 0;
     virtual void GetDimensions(uint32_t* width, uint32_t* height, int32_t* posX, int32_t* posY) = 0;
     virtual void SetDimensions(uint32_t width, uint32_t height, int32_t posX, int32_t posY) = 0;
     virtual Ship::WindowRect GetPrimaryMonitorRect() = 0;
