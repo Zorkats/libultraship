@@ -852,6 +852,108 @@ static void ApplyTileMaskExtent(const RDP* rdp, int tile, uint32_t& width, uint3
     }
 }
 
+static bool IsScaledLinearTexture(const RawTexMetadata& metadata) {
+    return metadata.resource != nullptr &&
+           (metadata.type == Fast::TextureType::RGBA16bpp ||
+            metadata.type == Fast::TextureType::GrayscaleAlpha8bpp ||
+            metadata.type == Fast::TextureType::GrayscaleAlpha4bpp) &&
+           (metadata.h_byte_scale != 1.0f || metadata.v_pixel_scale != 1.0f);
+}
+
+static uint32_t ScaledTextureBitsPerPixel(const RawTexMetadata& metadata) {
+    if (metadata.type == Fast::TextureType::GrayscaleAlpha4bpp) {
+        return 4;
+    }
+    return metadata.type == Fast::TextureType::GrayscaleAlpha8bpp ? 8u : 16u;
+}
+
+static bool ScaledTextureDimensions(const RawTexMetadata& metadata, uint32_t& sx, uint32_t& sy) {
+    const auto& tex = metadata.resource;
+    const float h = metadata.h_byte_scale, v = metadata.v_pixel_scale;
+    if (tex == nullptr || tex->ImageData == nullptr || !std::isfinite(h) || !std::isfinite(v) ||
+        h < 1 || v < 1 || h > 65535 || v > 65535 || std::floor(h) != h || std::floor(v) != v) {
+        return false;
+    }
+    sx = static_cast<uint32_t>(h);
+    sy = static_cast<uint32_t>(v);
+    return tex->Width > 0 && tex->Height > 0 && tex->Width % sx == 0 && tex->Height % sy == 0 &&
+           (uint64_t(tex->Width) * ScaledTextureBitsPerPixel(metadata)) % 8 == 0 &&
+           uint64_t(tex->Width) * tex->Height * ScaledTextureBitsPerPixel(metadata) / 8 <= tex->ImageDataSize;
+}
+
+static bool SetScaledTextureView(LoadedTexture& loaded, const uint8_t* source, uint32_t x, uint32_t y,
+                               uint32_t width, uint32_t height, uint32_t tmemLineBytes) {
+    uint32_t sx, sy;
+    if (!ScaledTextureDimensions(loaded.raw_tex_metadata, sx, sy) || width == 0 || height == 0) {
+        return false;
+    }
+    const auto& tex = loaded.raw_tex_metadata.resource;
+    if (width > tex->Width / sx || height > tex->Height / sy || x >= tex->Width / sx || y >= tex->Height / sy) {
+        return false;
+    }
+    const uintptr_t base = reinterpret_cast<uintptr_t>(tex->ImageData);
+    const uintptr_t address = reinterpret_cast<uintptr_t>(source);
+    const uint32_t pixelBits = ScaledTextureBitsPerPixel(loaded.raw_tex_metadata);
+    const uint64_t stride = uint64_t(tex->Width) * pixelBits;
+    if (address < base || address - base >= tex->ImageDataSize ||
+        ((address - base) * 8 + loaded.resource_bit_offset) % pixelBits != 0) {
+        return false;
+    }
+    const uint64_t offset = (address - base) * 8 + loaded.resource_bit_offset +
+                            uint64_t(y) * sy * stride + uint64_t(x) * sx * pixelBits;
+    const uint64_t rowBits = uint64_t(width) * sx * pixelBits;
+    const uint64_t rowBytes = (rowBits + 7) / 8;
+    const uint64_t rows = uint64_t(height) * sy;
+    if (rowBits > stride || rows > tex->Height || offset % stride + rowBits > stride ||
+        offset + (rows - 1) * stride + rowBits > uint64_t(tex->Width) * tex->Height * pixelBits ||
+        rowBytes * rows > UINT32_MAX) {
+        return false;
+    }
+    loaded.addr = tex->ImageData + offset / 8;
+    loaded.resource_bit_offset = static_cast<uint8_t>(offset % 8);
+    loaded.line_size_bytes = static_cast<uint32_t>(rowBytes);
+    loaded.full_image_line_size_bytes = static_cast<uint32_t>(stride / 8);
+    loaded.size_bytes = static_cast<uint32_t>(rowBytes * rows);
+    loaded.resource_width = width;
+    loaded.resource_height = height;
+    loaded.resource_tmem_line_bytes = tmemLineBytes;
+    return true;
+}
+
+static bool ScaledTextureExtent(const RDP* rdp, int tile, uint32_t maxTextureSize,
+                              uint32_t& width, uint32_t& height) {
+    const auto& tt = rdp->texture_tile[tile];
+    const auto& loaded = rdp->loaded_texture[tt.tmem_index];
+    uint32_t sx, sy;
+    if (!ScaledTextureDimensions(loaded.raw_tex_metadata, sx, sy) || loaded.addr == nullptr) {
+        return false;
+    }
+    if (loaded.raw_tex_metadata.type == Fast::TextureType::GrayscaleAlpha8bpp &&
+        (tt.fmt != G_IM_FMT_IA || tt.siz != G_IM_SIZ_8b)) {
+        return false;
+    }
+    if (loaded.raw_tex_metadata.type == Fast::TextureType::GrayscaleAlpha4bpp &&
+        (tt.fmt != G_IM_FMT_IA || tt.siz != G_IM_SIZ_4b)) {
+        return false;
+    }
+    width = loaded.resource_width;
+    height = loaded.resource_height;
+    const uint32_t tileWidth = tt.lrs >= tt.uls ? (tt.lrs - tt.uls + 4) / 4 : 0;
+    const uint32_t tileHeight = tt.lrt >= tt.ult ? (tt.lrt - tt.ult + 4) / 4 : 0;
+    const uint64_t loadedPixels = uint64_t(width) * height, tilePixels = uint64_t(tileWidth) * tileHeight;
+    const bool pyramid = tilePixels > 0 && loadedPixels > tilePixels && loadedPixels * 8 < tilePixels * 13;
+    if ((pyramid || (tt.cms & G_TX_CLAMP)) && tileWidth > 0) {
+        width = std::min(width, tileWidth);
+    }
+    if ((pyramid || (tt.cmt & G_TX_CLAMP)) && tileHeight > 0) {
+        height = std::min(height, tileHeight);
+    }
+    ApplyTileMaskExtent(rdp, tile, width, height, true);
+    const uint32_t limit = std::min(8192u, maxTextureSize);
+    return width > 0 && height > 0 && width <= loaded.resource_width && height <= loaded.resource_height &&
+           uint64_t(width) * sx <= limit && uint64_t(height) * sy <= limit;
+}
+
 void Interpreter::ImportTextureRgba16(int textureUnit, int tile, bool importReplacement, bool forceOpaqueAlpha) {
     const RawTexMetadata* metadata = &mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].raw_tex_metadata;
     const uint8_t* addr =
@@ -1018,14 +1120,21 @@ void Interpreter::ImportTextureRgba16(int textureUnit, int tile, bool importRepl
     }
     ApplyTileMaskExtent(mRdp, tile, width, height, /*maskAuthoritative=*/true);
 
-    // HD replacements store the full upscaled image in size_bytes, and sampling below reaches
-    // source rows up to height * v_pixel_scale. The stock rowStrideBytes*height bound would only
-    // cover the first 1/scale_factor of the source image, so the bottom of the tile reads as black.
-    const bool hdReplacement = metadata->resource != nullptr &&
-                               (metadata->h_byte_scale != 1.0f || metadata->v_pixel_scale != 1.0f);
+    const bool hdReplacement = !importReplacement && IsScaledLinearTexture(*metadata);
+    const bool legacyScaled = !hdReplacement && metadata->resource != nullptr &&
+                             (metadata->h_byte_scale != 1.0f || metadata->v_pixel_scale != 1.0f);
+    if (hdReplacement) {
+        if (!ScaledTextureExtent(mRdp, tile, mRapi->GetMaxTextureSize(), width, height)) {
+            return;
+        }
+        width *= static_cast<uint32_t>(metadata->h_byte_scale);
+        height *= static_cast<uint32_t>(metadata->v_pixel_scale);
+        fullImageLineSizeBytes = mRdp->loaded_texture[tmemTile.tmem_index].full_image_line_size_bytes;
+    }
     const uint32_t rowStrideBytes = (fullImageLineSizeBytes > 0) ? fullImageLineSizeBytes : (width * 2);
-    uint32_t readableBytes = (rowStrideBytes > 0 && height > 0 && !hdReplacement) ? rowStrideBytes * height
-                                                                                  : sizeBytes;
+    uint32_t readableBytes = hdReplacement
+        ? metadata->resource->ImageDataSize - static_cast<uint32_t>(addr - metadata->resource->ImageData)
+        : ((rowStrideBytes > 0 && height > 0 && !legacyScaled) ? rowStrideBytes * height : sizeBytes);
 #ifdef _WIN32
     {
         MEMORY_BASIC_INFORMATION mbi;
@@ -1046,7 +1155,7 @@ void Interpreter::ImportTextureRgba16(int textureUnit, int tile, bool importRepl
         }
     }
 #endif
-    if (rowStrideBytes > 0) {
+    if (rowStrideBytes > 0 && !hdReplacement) {
         const uint32_t maxRows = readableBytes / rowStrideBytes;
         if (height > maxRows) {
             height = maxRows;
@@ -1059,17 +1168,10 @@ void Interpreter::ImportTextureRgba16(int textureUnit, int tile, bool importRepl
     uint64_t transparentPixels = 0;
     uint64_t forcedOpaquePixels = 0;
 
-    // HD replacement textures are larger than the native tile. The clamp above keeps
-    // the GPU upload at the tile's logical size, but the source pixels must be sampled
-    // from the upscaled image (every Nth pixel) rather than cropped from the top-left.
     for (uint32_t y = 0; y < height; y++) {
         for (uint32_t x = 0; x < width; x++) {
-            uint32_t srcX = x;
-            uint32_t srcY = y;
-            if (hdReplacement) {
-                srcX = static_cast<uint32_t>(x * metadata->h_byte_scale);
-                srcY = static_cast<uint32_t>(y * metadata->v_pixel_scale);
-            }
+            const uint32_t srcX = legacyScaled ? static_cast<uint32_t>(x * metadata->h_byte_scale) : x;
+            const uint32_t srcY = legacyScaled ? static_cast<uint32_t>(y * metadata->v_pixel_scale) : y;
             uint32_t clrIdx = (srcY * (fullImageLineSizeBytes / 2)) + srcX;
 
             uint16_t col16 = (clrIdx < maxTexel) ? ((addr[2 * clrIdx] << 8) | addr[2 * clrIdx + 1]) : 0;
@@ -1248,15 +1350,25 @@ void Interpreter::ImportTextureIA4(int tile, bool importReplacement) {
     uint32_t width = widthBytes * 2;
     uint32_t height = widthBytes > 0 ? sizeBytes / widthBytes : 0;
 
-    if (fullImageLineSizeBytes == 0 || fullImageLineSizeBytes == sizeBytes) {
-        fullImageLineSizeBytes = widthBytes;
+    uint32_t firstNibble = 0;
+    if (IsScaledLinearTexture(*metadata)) {
+        if (!ScaledTextureExtent(mRdp, tile, mRapi->GetMaxTextureSize(), width, height)) {
+            return;
+        }
+        width *= static_cast<uint32_t>(metadata->h_byte_scale);
+        height *= static_cast<uint32_t>(metadata->v_pixel_scale);
+        firstNibble = mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].resource_bit_offset / 4;
+    } else {
+        if (fullImageLineSizeBytes == 0 || fullImageLineSizeBytes == sizeBytes) {
+            fullImageLineSizeBytes = widthBytes;
+        }
+        ApplyTileMaskExtent(mRdp, tile, width, height);
     }
-    ApplyTileMaskExtent(mRdp, tile, width, height);
 
     uint32_t i = 0;
     for (uint32_t y = 0; y < height; y++) {
         for (uint32_t x = 0; x < width; x++) {
-            uint32_t srcPixelIdx = y * (fullImageLineSizeBytes * 2) + x;
+            uint32_t srcPixelIdx = y * (fullImageLineSizeBytes * 2) + x + firstNibble;
             uint8_t byte = addr[srcPixelIdx / 2];
             uint8_t part = (byte >> (4 - (srcPixelIdx % 2) * 4)) & 0xf;
             uint8_t intensity = part >> 1;
@@ -1294,10 +1406,18 @@ void Interpreter::ImportTextureIA8(int tile, bool importReplacement) {
                                           mRdp->texture_tile[tile].line_size_bytes);
     uint32_t height = width > 0 ? sizeBytes / width : 0;
 
-    if (fullImageLineSizeBytes == 0 || fullImageLineSizeBytes == sizeBytes) {
-        fullImageLineSizeBytes = width;
+    if (IsScaledLinearTexture(*metadata)) {
+        if (!ScaledTextureExtent(mRdp, tile, mRapi->GetMaxTextureSize(), width, height)) {
+            return;
+        }
+        width *= static_cast<uint32_t>(metadata->h_byte_scale);
+        height *= static_cast<uint32_t>(metadata->v_pixel_scale);
+    } else {
+        if (fullImageLineSizeBytes == 0 || fullImageLineSizeBytes == sizeBytes) {
+            fullImageLineSizeBytes = width;
+        }
+        ApplyTileMaskExtent(mRdp, tile, width, height);
     }
-    ApplyTileMaskExtent(mRdp, tile, width, height);
 
     uint32_t i = 0;
     for (uint32_t y = 0; y < height; y++) {
@@ -2001,6 +2121,7 @@ void Interpreter::ImportTexture(int i, int tile, bool importReplacement) {
     key.cmt = mRdp->texture_tile[tile].cmt;
     key.masks = mRdp->texture_tile[tile].masks;
     key.maskt = mRdp->texture_tile[tile].maskt;
+    key.resource_bit_offset = mRdp->loaded_texture[tmemIdex].resource_bit_offset;
     static const bool diagnosticForcePreFlxOpaqueAlpha =
         std::getenv("GDX_DIAG_FORCE_PREFLX_OPAQUE_ALPHA") != nullptr;
     const bool forceOpaqueAlpha =
@@ -2046,6 +2167,12 @@ void Interpreter::ImportTexture(int i, int tile, bool importReplacement) {
         return;
     }
 
+    if (!importReplacement && IsScaledLinearTexture(*metadata)) {
+        uint32_t width, height;
+        if (!ScaledTextureExtent(mRdp, tile, mRapi->GetMaxTextureSize(), width, height)) {
+            return;
+        }
+    }
     if (TextureCacheLookup(i, key)) {
         return;
     }
@@ -2380,12 +2507,22 @@ extern "C" float gdx_get_widescreen_geometry_xscale(void) {
 
 // Widening multiplier for the game's CPU-side frustum tests: it culls against +-1.0 in its own
 // 4:3 projection space, but under hor+ the visible band is +-(aspect/(4/3)), so on-screen
-// ultrawide content was culled (side pop-in). Returns exactly 1.0 unless UltrawideMode is on and
-// the frame renders widescreen, so it is an IEEE-exact no-op in the stock configuration. Separate
-// from the geometry xscale above because this one changes culling and stays opt-in.
+// ultrawide content was culled (side pop-in). Auto-gated by the current framebuffer aspect: the
+// widening factor is exactly 1.0 unless the CVar is on AND the aspect is wider than 16:9, so it
+// stays an IEEE-exact no-op on 16:9 and narrower. Separate from the geometry xscale above because
+// this one changes culling and stays opt-in.
 extern "C" float gdx_get_ultrawide_cull_xscale(void) {
     auto gfx = mInstance.lock();
     if (!gfx || !gfx->mUltrawideCache) {
+        return 1.0f;
+    }
+    if (gfx->mCurDimensions.width == 0 || gfx->mCurDimensions.height == 0) {
+        return 1.0f;
+    }
+    const float aspect = (float)gfx->mCurDimensions.width / (float)gfx->mCurDimensions.height;
+    // 16:9 is the stock cull boundary; only widen when the output is meaningfully wider so 16:9
+    // users get bit-exact stock behavior even with the CVar enabled.
+    if (aspect <= (16.0f / 9.0f) + 0.001f) {
         return 1.0f;
     }
     const float xscale = gdx_get_widescreen_geometry_xscale();
@@ -3111,6 +3248,12 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
                       (mRdp->other_mode_l & (3 << 18)) == (G_BL_1MA << 18));
     uint8_t blend_src = mRdp->other_mode_l >> 30;
     bool use_blend_color = blend_src == G_BL_CLR_BL;
+    constexpr uint32_t constantBlendMode =
+        (GBL_c1(G_BL_CLR_BL, G_BL_0, G_BL_CLR_BL, G_BL_1)) |
+        (GBL_c2(G_BL_CLR_BL, G_BL_0, G_BL_CLR_BL, G_BL_1));
+    // Both cycles select only blend color; inherited material and fog alpha cannot contribute.
+    const float blendFactor = (mRdp->other_mode_l & 0xFFFF0000u) == constantBlendMode
+                                 ? 1.0f : mRdp->fog_color.a / 255.0f;
     bool use_fog = blend_src == G_BL_CLR_FOG || use_blend_color;
     const bool originalUseFog = use_fog;
     bool texture_edge = (mRdp->other_mode_l & CVG_X_ALPHA) == CVG_X_ALPHA;
@@ -3376,6 +3519,10 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
                 tex_height[i] = tex_height2[i];
             }
             ApplyTileMaskExtent(mRdp, tile, tex_width[i], tex_height[i], /*maskAuthoritative=*/true);
+            if (IsScaledLinearTexture(activeLoaded.raw_tex_metadata) &&
+                !ScaledTextureExtent(mRdp, tile, mRapi->GetMaxTextureSize(), tex_width[i], tex_height[i])) {
+                return;
+            }
             /* One line per distinct draw-time UV-extent state: tex_w/h feed texcoord
                normalization, and a mismatch against the uploaded decode extent is the bug. */
             {
@@ -3499,7 +3646,7 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
             mGeometryDiagnostics.fogTriangles++;
             for (const LoadedVertex* vertex : v_arr) {
                 const float fogFactor =
-                    use_blend_color ? mRdp->fog_color.a / 255.0f : vertex->color.a / 255.0f;
+                    use_blend_color ? blendFactor : vertex->color.a / 255.0f;
                 mGeometryDiagnostics.minFogFactor =
                     std::min(mGeometryDiagnostics.minFogFactor, fogFactor);
                 mGeometryDiagnostics.maxFogFactor =
@@ -3713,11 +3860,10 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
 
         if (use_fog) {
             if (use_blend_color) {
-                // Shroud/blend mode: blend toward blend_color using fog alpha as factor
                 mBufVbo[mBufVboLen++] = mRdp->blend_color.r / 255.0f;
                 mBufVbo[mBufVboLen++] = mRdp->blend_color.g / 255.0f;
                 mBufVbo[mBufVboLen++] = mRdp->blend_color.b / 255.0f;
-                mBufVbo[mBufVboLen++] = mRdp->fog_color.a / 255.0f;
+                mBufVbo[mBufVboLen++] = blendFactor;
             } else {
                 mBufVbo[mBufVboLen++] = mRdp->fog_color.r / 255.0f;
                 mBufVbo[mBufVboLen++] = mRdp->fog_color.g / 255.0f;
@@ -4278,7 +4424,10 @@ void Interpreter::StoreLoadedTexture(uint16_t tmemStart, const LoadedTexture& te
     }
 
     const uint32_t logicalSize = texture.orig_size_bytes != 0 ? texture.orig_size_bytes : texture.size_bytes;
-    const uint32_t requestedWords = std::max(1u, (logicalSize + kTmemWordBytes - 1u) / kTmemWordBytes);
+    const uint64_t span = texture.resource_tmem_line_bytes != 0
+        ? std::max<uint64_t>(logicalSize, uint64_t(texture.resource_tmem_line_bytes) * texture.resource_height)
+        : logicalSize;
+    const uint32_t requestedWords = static_cast<uint32_t>(std::min<uint64_t>(512, std::max<uint64_t>(1, (span + 7) / 8)));
     const uint32_t wordCount = std::min(requestedWords, kTmemWordCount - tmemStart);
     const uint32_t newEnd = tmemStart + wordCount;
 
@@ -4299,13 +4448,28 @@ void Interpreter::StoreLoadedTexture(uint16_t tmemStart, const LoadedTexture& te
     // at offsets inside a LOADBLOCK/LOADTILE range, not only at its base.
     for (uint32_t word = 0; word < wordCount; ++word) {
         const uint32_t logicalByteOffset = word * kTmemWordBytes;
+        LoadedTexture entry = texture;
+        entry.tmem_start = tmemStart;
+        entry.tmem_word_count = static_cast<uint16_t>(wordCount);
+        if (texture.resource_tmem_line_bytes != 0) {
+            const uint32_t row = logicalByteOffset / texture.resource_tmem_line_bytes;
+            const uint32_t column = (logicalByteOffset % texture.resource_tmem_line_bytes) * 8 /
+                                    ScaledTextureBitsPerPixel(texture.raw_tex_metadata);
+            if (row >= texture.resource_height || column >= texture.resource_width ||
+                !SetScaledTextureView(entry, texture.addr, column, row, texture.resource_width - column,
+                                    texture.resource_height - row, texture.resource_tmem_line_bytes)) {
+                entry.addr = nullptr;
+                entry.size_bytes = 0;
+            }
+            entry.orig_size_bytes = texture.orig_size_bytes > logicalByteOffset
+                ? texture.orig_size_bytes - logicalByteOffset : 0;
+            mRdp->loaded_texture[tmemStart + word] = entry;
+            continue;
+        }
         const uint32_t hostByteOffset =
             logicalSize != 0 ? static_cast<uint32_t>((static_cast<uint64_t>(logicalByteOffset) * texture.size_bytes) /
                                                      logicalSize)
                              : logicalByteOffset;
-        LoadedTexture entry = texture;
-        entry.tmem_start = tmemStart;
-        entry.tmem_word_count = static_cast<uint16_t>(wordCount);
         if (entry.addr != nullptr) {
             entry.addr += hostByteOffset;
         }
@@ -4323,24 +4487,10 @@ void Interpreter::StoreLoadedTexture(uint16_t tmemStart, const LoadedTexture& te
     }
 }
 
-/* Per-tile atlas texture override (devdocs/MODDING_ATLAS_DESIGN.md; mechanism corrected in
-   devdocs/POST_1_0_SCOPING.md "Per-tile atlas overrides"). Called at the two loaded.addr
-   assignment sites (LoadBlock / LoadTile) AFTER the band byte offset has been folded into
-   loaded.addr by the row/column math: the containing-range registry lookup recovers
-   (baseKey, byteOffset), and the workshop layer is queried for
-   "atlas/<baseKey>/o<byteOffset>/<FMT>/<W>x<H>". On a hit the slot is re-pointed at the pack OTEX
-   payload and raw_tex_metadata is filled exactly as if GfxDpSetTextureImage had served that OTEX,
-   so every importer works unchanged and metadata->resource != nullptr auto-skips the
-   TMEM-emulation decode branch. The caller must also skip its TMEM mirror (the band's texels no
-   longer come from DRAM). A miss leaves the slot untouched, so partial packs replace only the
-   bands they provide and the rest decode stock.
-
-   CI bands are refused here: a paletted atlas band has no palette side-channel at runtime (the
-   dumped swatch is a packer-side quantization target only), so CI atlas keys stay dump-only.
-   scaleLineSizes mirrors the two call sites' own OTR treatment of the scale fields: LoadTile
-   scales its line sizes by h_byte_scale; LoadBlock now does the same. */
+// Lookup needs the band's native offset in its parent atlas. A replacement owns tightly packed
+// rows, independent of that parent's stride. CI bands have no runtime palette side-channel.
 static bool GdxTryAtlasTileOverride(RDP* rdp, LoadedTexture& loaded, uint8_t loadTile, uint32_t bandWidth,
-                                    uint32_t bandHeight, bool scaleLineSizes) {
+                                    uint32_t bandHeight, bool block) {
     if (loaded.addr == nullptr || loaded.raw_tex_metadata.resource != nullptr || bandWidth == 0 || bandHeight == 0) {
         return false;
     }
@@ -4367,6 +4517,19 @@ static bool GdxTryAtlasTileOverride(RDP* rdp, LoadedTexture& loaded, uint8_t loa
     if (tex == nullptr || tex->ImageData == nullptr) {
         return false;
     }
+    LoadedTexture replacement = loaded;
+    replacement.raw_tex_metadata = {tex->Width, tex->Height, tex->HByteScale, tex->VPixelScale, tex, tex->Type};
+    replacement.resource_bit_offset = 0;
+    if (IsScaledLinearTexture(replacement.raw_tex_metadata)) {
+        const uint32_t rowBytes = (bandWidth * ScaledTextureBitsPerPixel(replacement.raw_tex_metadata) + 7) / 8;
+        const uint32_t tmemLine = block ? rowBytes : (rowBytes + 7) & ~7u;
+        if (!SetScaledTextureView(replacement, tex->ImageData, 0, 0, bandWidth, bandHeight, tmemLine)) {
+            return false;
+        }
+        replacement.tex_flags = tex->Flags;
+        loaded = std::move(replacement);
+        return true;
+    }
     loaded.raw_tex_metadata.width = tex->Width;
     loaded.raw_tex_metadata.height = tex->Height;
     loaded.raw_tex_metadata.h_byte_scale = tex->HByteScale;
@@ -4377,15 +4540,60 @@ static bool GdxTryAtlasTileOverride(RDP* rdp, LoadedTexture& loaded, uint8_t loa
     loaded.addr = reinterpret_cast<const uint8_t*>(tex->ImageData);
     loaded.size_bytes =
         static_cast<uint32_t>(loaded.orig_size_bytes * tex->HByteScale * tex->VPixelScale);
-    if (scaleLineSizes) {
-        loaded.line_size_bytes = static_cast<uint32_t>(loaded.line_size_bytes * tex->HByteScale);
-        loaded.full_image_line_size_bytes =
-            static_cast<uint32_t>(loaded.full_image_line_size_bytes * tex->HByteScale);
-    }
+    loaded.line_size_bytes = static_cast<uint32_t>(loaded.line_size_bytes * tex->HByteScale);
+    // An atlas replacement owns only this band, not the parent atlas's wider rows.
+    loaded.full_image_line_size_bytes = loaded.line_size_bytes;
     return true;
 }
 
+void Interpreter::LoadScaledTexture(uint8_t tile, uint32_t x, uint32_t y, uint32_t width, uint32_t height, bool block) {
+    const auto& source = mRdp->texture_to_load;
+    LoadedTexture loaded{};
+    loaded.raw_tex_metadata = source.raw_tex_metadata;
+    loaded.tex_flags = source.tex_flags;
+    const uint32_t pixelBits = ScaledTextureBitsPerPixel(source.raw_tex_metadata);
+    const uint64_t rowBytes = (uint64_t(width) * pixelBits + 7) / 8;
+    const uint64_t bytes = rowBytes * height;
+    loaded.orig_size_bytes = static_cast<uint32_t>(std::min<uint64_t>(bytes, UINT32_MAX));
+    const uint32_t line = static_cast<uint32_t>(block ? rowBytes : (rowBytes + 7) & ~uint64_t(7));
+    uint32_t sx, sy;
+    const auto& tex = source.raw_tex_metadata.resource;
+    if (ScaledTextureDimensions(source.raw_tex_metadata, sx, sy) && x < tex->Width / sx && y < tex->Height / sy) {
+        // Sprite blits request fixed-height TMEM bands, including beyond the image's last row.
+        // Keep the transfer span for invalidation but decode only the resource's available pixels.
+        width = std::min(width, tex->Width / sx - x);
+        height = std::min(height, tex->Height / sy - y);
+    }
+    const uint8_t logicalSize = pixelBits == 16 ? G_IM_SIZ_16b : pixelBits == 8 ? G_IM_SIZ_8b : G_IM_SIZ_4b;
+    const bool compatibleSize = source.siz == logicalSize || (block && source.siz == G_IM_SIZ_16b);
+    if (compatibleSize && bytes <= UINT32_MAX) {
+        SetScaledTextureView(loaded, source.addr, x, y, width, height, line);
+    }
+    const auto masked = mMaskedTextures.find(GetBaseTexturePath(source.raw_tex_metadata.resource->GetInitData()->Path));
+    if (masked != mMaskedTextures.end()) {
+        loaded.masked = true;
+        loaded.blended = masked->second.replacementData != nullptr;
+    }
+    StoreLoadedTexture(mRdp->texture_tile[tile].tmem_index, loaded);
+    mRdp->textures_changed[0] = mRdp->textures_changed[1] = true;
+}
+
 void Interpreter::GfxDpLoadBlock(uint8_t tile, uint32_t uls, uint32_t ult, uint32_t lrs, uint32_t dxt) {
+    if (IsScaledLinearTexture(mRdp->texture_to_load.raw_tex_metadata)) {
+        uint32_t sx, sy, width = 0;
+        const auto& source = mRdp->texture_to_load;
+        if (ScaledTextureDimensions(source.raw_tex_metadata, sx, sy)) {
+            width = source.width > 1 ? source.width : source.raw_tex_metadata.resource->Width / sx;
+        }
+        const uint32_t pixelBits = ScaledTextureBitsPerPixel(source.raw_tex_metadata);
+        const uint32_t transferBits = 4u << source.siz;
+        const uint64_t bits = (uint64_t(lrs) + 1) * transferBits;
+        const uint64_t rowBits = uint64_t(width) * pixelBits;
+        const uint32_t height = rowBits != 0 && bits % rowBits == 0
+            ? static_cast<uint32_t>(bits / rowBits) : 0;
+        LoadScaledTexture(tile, uls * transferBits / pixelBits, ult, width, height, true);
+        return;
+    }
     const auto byteCountForTexels = [](uint64_t texels, uint8_t siz) -> uint32_t {
         uint64_t bytes = 0;
         switch (siz) {
@@ -4513,7 +4721,7 @@ void Interpreter::GfxDpLoadBlock(uint8_t tile, uint32_t uls, uint32_t ult, uint3
         const uint32_t bandLineBytes = byteCountForTexels(bandWidth, mRdp->texture_to_load.siz);
         if (bandWidth > 1 && bandLineBytes != 0 && orig_size_bytes % bandLineBytes == 0) {
             atlasOverridden = GdxTryAtlasTileOverride(mRdp, loaded, tile, bandWidth,
-                                                      orig_size_bytes / bandLineBytes, /*scaleLineSizes=*/false);
+                                                      orig_size_bytes / bandLineBytes, true);
         }
     }
     // fprintf(stderr, "GfxDpLoadBlock: line_size = 0x%x; orig = 0x%x; bpp=%d; lrs=%d\n", size_bytes,
@@ -4589,6 +4797,16 @@ void Interpreter::GfxDpLoadBlock(uint8_t tile, uint32_t uls, uint32_t ult, uint3
 void Interpreter::GfxDpLoadTile(uint8_t tile, uint32_t uls, uint32_t ult, uint32_t lrs, uint32_t lrt) {
     SUPPORT_CHECK(tile == G_TX_LOADTILE);
 
+    if (IsScaledLinearTexture(mRdp->texture_to_load.raw_tex_metadata)) {
+        LoadScaledTexture(tile, uls >> 2, ult >> 2, lrs >= uls ? ((lrs - uls) >> 2) + 1 : 0,
+                        lrt >= ult ? ((lrt - ult) >> 2) + 1 : 0, false);
+        mRdp->texture_tile[tile].uls = uls;
+        mRdp->texture_tile[tile].ult = ult;
+        mRdp->texture_tile[tile].lrs = lrs;
+        mRdp->texture_tile[tile].lrt = lrt;
+        return;
+    }
+
     uint32_t word_size_shift = 0;
     switch (mRdp->texture_to_load.siz) {
         case G_IM_SIZ_4b:
@@ -4643,7 +4861,7 @@ void Interpreter::GfxDpLoadTile(uint8_t tile, uint32_t uls, uint32_t ult, uint32
     // Per-tile atlas override: start_offset_bytes is the band's byte offset within its containing
     // registered buffer, now baked into loaded.addr. tile_width/tile_height are the band dims.
     const bool atlasOverridden =
-        GdxTryAtlasTileOverride(mRdp, loaded, tile, tile_width, tile_height, /*scaleLineSizes=*/true);
+        GdxTryAtlasTileOverride(mRdp, loaded, tile, tile_width, tile_height, false);
 
     const std::string_view texPath =
         mRdp->texture_to_load.raw_tex_metadata.resource != nullptr

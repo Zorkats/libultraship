@@ -82,6 +82,9 @@ static void GdxTracePointer(const char* what, float x, float y, int which, const
 LONG_PTR SDL_WndProc;
 #endif
 
+// port/gdx_course_edit_mouse.cpp — Course Edit wheel zoom accumulator.
+extern "C" void gdx_course_edit_mouse_on_wheel(int detents);
+
 namespace Fast {
 const SDL_Scancode lus_to_sdl_table[] = {
     SDL_SCANCODE_UNKNOWN,
@@ -716,6 +719,8 @@ void GfxWindowBackendSDL2::HandleSingleEvent(SDL_Event& event) {
         case SDL_MOUSEWHEEL:
             mMouseWheelX = event.wheel.x;
             mMouseWheelY = event.wheel.y;
+            // G-Diffuser Course Edit wheel zoom accumulator (port/gdx_course_edit_mouse.cpp).
+            gdx_course_edit_mouse_on_wheel(event.wheel.y);
             break;
         // ImGui's SDL2 backend does not translate SDL_FINGER events, so the primary finger is fed
         // in as a left-mouse pointer -- but the press is held back one event first.

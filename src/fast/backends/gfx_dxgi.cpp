@@ -366,6 +366,9 @@ void GfxWindowBackendDXGI::HandleRawInputBuffered() {
     }
 }
 
+// port/gdx_course_edit_mouse.cpp — Course Edit wheel zoom accumulator.
+extern "C" void gdx_course_edit_mouse_on_wheel(int detents);
+
 static LRESULT CALLBACK gfx_dxgi_wnd_proc(HWND h_wnd, UINT message, WPARAM w_param, LPARAM l_param) {
 
     char fileName[256];
@@ -474,9 +477,13 @@ static LRESULT CALLBACK gfx_dxgi_wnd_proc(HWND h_wnd, UINT message, WPARAM w_par
         case WM_MOUSEHWHEEL:
             self->mMouseWheel[0] = GET_WHEEL_DELTA_WPARAM(w_param) / WHEEL_DELTA;
             break;
-        case WM_MOUSEWHEEL:
-            self->mMouseWheel[1] = GET_WHEEL_DELTA_WPARAM(w_param) / WHEEL_DELTA;
+        case WM_MOUSEWHEEL: {
+            const int detents = GET_WHEEL_DELTA_WPARAM(w_param) / WHEEL_DELTA;
+            self->mMouseWheel[1] = detents;
+            // G-Diffuser Course Edit wheel zoom accumulator (port/gdx_course_edit_mouse.cpp).
+            gdx_course_edit_mouse_on_wheel(detents);
             break;
+        }
         case WM_INPUT: {
             // At this point the top most message should already be off the queue.
             // So we don't need to get it all, if mouse isn't captured.

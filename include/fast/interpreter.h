@@ -203,6 +203,7 @@ struct TextureCacheKey {
     // fade rewrites the palette content in place at one address, so an address-only key freezes
     // the fade. Left 0 unless GDX_CI_PALETTE_HASH is set, pending validation.
     uint32_t palette_content_hash = 0;
+    uint8_t resource_bit_offset = 0;
 
     bool operator==(const TextureCacheKey&) const noexcept = default;
 
@@ -268,6 +269,11 @@ struct LoadedTexture {
     bool blended;
     uint16_t tmem_start;
     uint16_t tmem_word_count;
+    // Resource views retain native texel units and TMEM padding, unlike physical source rows.
+    uint32_t resource_width;
+    uint32_t resource_height;
+    uint32_t resource_tmem_line_bytes;
+    uint8_t resource_bit_offset;
 };
 
 #define MAX_LIGHTS 32
@@ -623,6 +629,7 @@ class Interpreter {
     // keyed against it stale. No-op unless the address was seen as a TLUT source.
     void TextureCacheDeletePalette(const uint8_t* paletteAddr);
     void ImportTextureRgba16(int textureUnit, int tile, bool importReplacement, bool forceOpaqueAlpha);
+    void LoadScaledTexture(uint8_t tile, uint32_t x, uint32_t y, uint32_t width, uint32_t height, bool block);
     void ImportTextureRgba32(int tile, bool importReplacement);
     void ImportTextureIA4(int tile, bool importReplacement);
     void ImportTextureIA8(int tile, bool importReplacement);

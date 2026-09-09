@@ -194,6 +194,10 @@ bool Fast3dWindow::IsFrameReady() {
 /* Implemented in port/n64_gfx_bridge.cpp; a weak no-op is not available across this boundary, so
    the port always defines it. Called once per sub-frame render, before any blit or present. */
 extern "C" void gdx_gfx_post_run_capture(void);
+// port/gdx_course_edit_mouse.cpp — Course Edit tool keys / rebind capture / wheel accumulator.
+extern "C" int gdx_course_edit_mouse_on_key(int lusScancode, int isDown);
+extern "C" int gdx_course_edit_mouse_owns_button(int button);
+extern "C" void gdx_course_edit_mouse_all_keys_up(void);
 
 /* Sub-frame present bypass.
  *
@@ -409,9 +413,14 @@ bool Fast3dWindow::KeyUp(int32_t scancode) {
         ctx->GetWindow()->GetMouseStateManager()->ToggleMouseCaptureOverride();
     }
 
+    // G-Diffuser Course Edit tool keys; backend-agnostic (LUS KbScancode space on both backends).
+    int consumed = gdx_course_edit_mouse_on_key(scancode, 0);
+
     ctx->GetWindow()->SetLastScancode(-1);
-    return ctx->GetControlDeck()->ProcessKeyboardEvent(Ship::KbEventType::LUS_KB_EVENT_KEY_UP,
-                                                       static_cast<Ship::KbScancode>(scancode));
+    // A key pressed before the editor took ownership must still release its mapped action.
+    bool processed = ctx->GetControlDeck()->ProcessKeyboardEvent(Ship::KbEventType::LUS_KB_EVENT_KEY_UP,
+                                                                static_cast<Ship::KbScancode>(scancode));
+    return consumed || processed;
 }
 
 bool Fast3dWindow::KeyDown(int32_t scancode) {
@@ -419,6 +428,20 @@ bool Fast3dWindow::KeyDown(int32_t scancode) {
     if (ctx == nullptr) {
         return false;
     }
+    if (scancode == ctx->GetWindow()->GetFullscreenScancode() ||
+        scancode == ctx->GetWindow()->GetMouseCaptureScancode()) {
+        ctx->GetWindow()->SetLastScancode(scancode);
+        return ctx->GetControlDeck()->ProcessKeyboardEvent(Ship::KbEventType::LUS_KB_EVENT_KEY_DOWN,
+                                                           static_cast<Ship::KbScancode>(scancode));
+    }
+
+    // G-Diffuser Course Edit tool keys and menu rebind capture; see KeyUp above.
+    int consumed = gdx_course_edit_mouse_on_key(scancode, 1);
+    if (consumed) {
+        ctx->GetWindow()->SetLastScancode(scancode);
+        return true;
+    }
+
     bool isProcessed = ctx->GetControlDeck()->ProcessKeyboardEvent(Ship::KbEventType::LUS_KB_EVENT_KEY_DOWN,
                                                                    static_cast<Ship::KbScancode>(scancode));
     ctx->GetWindow()->SetLastScancode(scancode);
@@ -431,6 +454,7 @@ void Fast3dWindow::AllKeysUp() {
     if (ctx == nullptr) {
         return;
     }
+    gdx_course_edit_mouse_all_keys_up();
     ctx->GetControlDeck()->ProcessKeyboardEvent(Ship::KbEventType::LUS_KB_EVENT_ALL_KEYS_UP,
                                                 Ship::KbScancode::LUS_KB_UNKNOWN);
 }
@@ -447,6 +471,9 @@ bool Fast3dWindow::MouseButtonDown(int button) {
     auto ctx = Ship::Context::GetInstance();
     if (ctx == nullptr) {
         return false;
+    }
+    if (gdx_course_edit_mouse_owns_button(button)) {
+        return true;
     }
     bool isProcessed = ctx->GetControlDeck()->ProcessMouseButtonEvent(true, static_cast<Ship::MouseBtn>(button));
     return isProcessed;
