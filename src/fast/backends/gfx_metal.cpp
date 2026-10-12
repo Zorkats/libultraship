@@ -118,8 +118,13 @@ void GfxRenderingAPIMetal::RenderDrawData(ImDrawData* drawData) {
     MTL::Texture* screen_texture = mTextures[framebuffer.mTextureId].texture;
     int fb_width = (int)(drawData->DisplaySize.x * drawData->FramebufferScale.x);
     int fb_height = (int)(drawData->DisplaySize.y * drawData->FramebufferScale.y);
-    if (screen_texture->width() != fb_width || screen_texture->height() != fb_height)
+    if (screen_texture->width() != fb_width || screen_texture->height() != fb_height) {
         return;
+    }
+
+    if (!framebuffer.mCommandBuffer || !framebuffer.mCommandEncoder) {
+        return;
+    }
 
     ImGui_ImplMetal_RenderDrawData(drawData, framebuffer.mCommandBuffer, framebuffer.mCommandEncoder);
 }
@@ -610,6 +615,7 @@ void GfxRenderingAPIMetal::EndFrame() {
             framebuffer.mCommandEncoder->endEncoding();
 
         framebuffer.mCommandBuffer->commit();
+        framebuffer.mCommandBuffer->waitUntilCompleted();
         it++;
     }
 
@@ -773,7 +779,7 @@ void GfxRenderingAPIMetal::SetupScreenFramebuffer(uint32_t width, uint32_t heigh
 
 void GfxRenderingAPIMetal::UpdateFramebufferParameters(int fb_id, uint32_t width, uint32_t height, uint32_t msaa_level,
                                                        bool opengl_invertY, bool render_target, bool has_depth_buffer,
-                                                       bool can_extract_depth) {
+                                                       bool can_extract_depth, GdxFramebufferFormat format) {
     // Screen framebuffer is handled separately on a frame by frame basis
     // see `SetupScreenFramebuffer`.
     if (fb_id == 0) {
