@@ -31,6 +31,7 @@ class Buffer;
 class RenderPipelineState;
 class ComputePipelineState;
 class CommandQueue;
+class Event;
 class Viewport;
 } // namespace MTL
 
@@ -191,6 +192,9 @@ class GfxRenderingAPIMetal final : public GfxRenderingAPI {
     MTL::Device* mDevice;
     MTL::CommandQueue* mCommandQueue;
     MTL::CommandQueue* mReadbackQueue;
+    MTL::Event* mFrameSyncEvent = nullptr;
+    uint64_t mFrameSyncValue = 0;
+    bool mOffscreenFbActive = false;
 
 
     int mCurrentVertexBufferPoolIndex = 0;

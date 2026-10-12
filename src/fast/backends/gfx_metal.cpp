@@ -80,6 +80,7 @@ bool GfxRenderingAPIMetal::MetalInit(SDL_Renderer* renderer) {
     mDevice = mLayer->device();
     mCommandQueue = mDevice->newCommandQueue();
     mReadbackQueue = mDevice->newCommandQueue();
+    mFrameSyncEvent = mDevice->newEvent();
 
     for (size_t i = 0; i < kMaxVertexBufferPoolSize; i++) {
         MTL::Buffer* new_buffer = mDevice->newBuffer(256 * 32 * 3 * sizeof(float) * 50, MTL::ResourceStorageModeShared);
@@ -586,6 +587,8 @@ void GfxRenderingAPIMetal::OnResize() {
 }
 
 void GfxRenderingAPIMetal::StartFrame() {
+    mFrameSyncValue++;
+    mOffscreenFbActive = false;
     mFrameUniforms.frameCount++;
     if (mFrameUniforms.frameCount > 150) {
         // No high values, as noise starts to look ugly
@@ -614,8 +617,11 @@ void GfxRenderingAPIMetal::EndFrame() {
         if (!framebuffer.mHasEndedEncoding)
             framebuffer.mCommandEncoder->endEncoding();
 
+        // GPU-side sync: signal the event after this FB's work completes.
+        // The screen framebuffer (fb=0) has a matching wait encoded before
+        // its render pass, so it won't read this FB's texture until done.
+        framebuffer.mCommandBuffer->encodeSignalEvent(mFrameSyncEvent, mFrameSyncValue);
         framebuffer.mCommandBuffer->commit();
-        framebuffer.mCommandBuffer->waitUntilCompleted();
         it++;
     }
 
@@ -930,6 +936,20 @@ void GfxRenderingAPIMetal::StartDrawToFramebuffer(int fb_id, float noise_scale) 
         if (!fb.mUseReadbackQueue) {
             // Queue the command buffers in order of start draw
             fb.mCommandBuffer->enqueue();
+        }
+
+        // Track whether any offscreen FB was drawn this frame.
+        if (fb_id != 0) {
+            mOffscreenFbActive = true;
+        }
+
+        // GPU-side sync: make the screen framebuffer wait for offscreen FBs
+        // to finish rendering before its render pass reads their textures.
+        // Only wait when an offscreen FB was actually drawn this frame;
+        // otherwise (e.g. logo screen) there is no matching signal and
+        // the GPU would deadlock.
+        if (fb_id == 0 && mFrameSyncEvent && mOffscreenFbActive) {
+            fb.mCommandBuffer->encodeWait(mFrameSyncEvent, mFrameSyncValue);
         }
 
         fb.mCommandEncoder = fb.mCommandBuffer->renderCommandEncoder(fb.mRenderPassDescriptor);
