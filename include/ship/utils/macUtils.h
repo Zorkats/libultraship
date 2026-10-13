@@ -18,6 +18,13 @@ void toggleNativeMacOSFullscreen(SDL_Window* window);
  */
 bool isNativeMacOSFullscreenActive(SDL_Window* window);
 
+/**
+ * @brief Sets a CAMetalLayer's opaque flag. A non-opaque layer keeps macOS from scanning it out
+ * directly to the display when it covers the whole screen (full screen / borderless).
+ * @param metalLayer The CAMetalLayer (as void*, e.g. from SDL_RenderGetMetalLayer).
+ */
+void setMetalLayerOpaque(void* metalLayer, bool opaque);
+
 #ifdef __cplusplus
 }
 #endif

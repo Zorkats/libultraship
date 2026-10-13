@@ -7,7 +7,11 @@
 
 #ifdef __APPLE__
 
+#include <atomic>
+#include <string>
+#include <cstdio>
 #include "fast/backends/gfx_metal.h"
+#include "ship/utils/macUtils.h"
 
 #include <vector>
 #include <algorithm>
@@ -76,6 +80,18 @@ bool GfxRenderingAPIMetal::MetalInit(SDL_Renderer* renderer) {
 
     mLayer = (CA::MetalLayer*)SDL_RenderGetMetalLayer(renderer);
     mLayer->setPixelFormat(MTL::PixelFormatBGRA8Unorm);
+    // The screen drawable is also a copy SOURCE: CopyFramebuffer(dst, 0) and the screen readback
+    // blit both read it. A framebufferOnly drawable (the CAMetalLayer default) may only be rendered
+    // into, so those copies were invalid and could fail the whole screen command buffer (GPU
+    // timeout, then macOS ignoring the app) -- seen in full screen, where the game reads the screen
+    // directly. The cost of a sampleable drawable is negligible for this renderer.
+    mLayer->setFramebufferOnly(false);
+    // When an opaque layer covers the whole display (native or borderless full screen), macOS
+    // scans it out directly instead of compositing it. On that path the screen's render pass
+    // faulted every frame from car select (GPU timeout, black screen, WindowServer lockup), while
+    // the same rendering in a window -- even one dragged to nearly full size -- was clean. A
+    // non-opaque layer keeps the compositor in the path.
+    setMetalLayerOpaque(mLayer, false);
 
     mDevice = mLayer->device();
     mCommandQueue = mDevice->newCommandQueue();
@@ -112,15 +128,63 @@ void GfxRenderingAPIMetal::SetupFloatingFrame() {
     ImGui_ImplMetal_NewFrame(current_render_pass);
 }
 
+// Diagnostics: report a failed command buffer (rate-limited). Per-encoder states are listed only
+// if the buffer was created with CommandBufferErrorOptionEncoderExecutionStatus, which is left off
+// in normal builds because of its GPU overhead; add it back when chasing a GPU fault.
+static void GdxReportCommandBufferFailure(MTL::CommandBuffer* cb) {
+    static std::atomic<unsigned> sFailures{ 0 };
+    if (cb->status() != MTL::CommandBufferStatusError) {
+        return;
+    }
+    unsigned n = sFailures++;
+    if (n >= 12 && (n % 600) != 0) {
+        return;
+    }
+    NS::Error* err = cb->error();
+    NS::String* cbLabel = cb->label();
+    fprintf(stderr, "[metal-diag] command buffer '%s' FAILED: %s\n", cbLabel ? cbLabel->utf8String() : "?",
+            (err && err->localizedDescription()) ? err->localizedDescription()->utf8String() : "(no error)");
+    if (err == nullptr || err->userInfo() == nullptr || n >= 4) {
+        return;
+    }
+    NS::Array* infos = err->userInfo()->object<NS::Array>(MTL::CommandBufferEncoderInfoErrorKey);
+    if (infos == nullptr) {
+        return;
+    }
+    static const char* kStates[] = { "unknown", "completed", "affected", "pending", "FAULTED" };
+    for (NS::UInteger i = 0; i < infos->count(); i++) {
+        MTL::CommandBufferEncoderInfo* info = infos->object<MTL::CommandBufferEncoderInfo>(i);
+        NS::String* label = info->label();
+        unsigned st = (unsigned)info->errorState();
+        fprintf(stderr, "[metal-diag]   encoder %lu '%s': %s\n", (unsigned long)i,
+                label ? label->utf8String() : "(unlabeled)", st < 5 ? kStates[st] : "?");
+    }
+}
+
 void GfxRenderingAPIMetal::RenderDrawData(ImDrawData* drawData) {
     auto framebuffer = mFramebuffers[0];
 
-    // Workaround for detecting when transitioning to/from full screen mode.
+    // The drawable and ImGui's DisplaySize * FramebufferScale can disagree (full-screen transition,
+    // Retina scale rounding). The old workaround dropped the whole composite on any mismatch, which
+    // left the screen black for as long as they disagreed. Instead, re-derive the scale from the
+    // drawable so ImGui's viewport and clip rects (clamped to that size) always fit the texture.
     MTL::Texture* screen_texture = mTextures[framebuffer.mTextureId].texture;
+    if (screen_texture == nullptr || drawData->DisplaySize.x <= 0.0f || drawData->DisplaySize.y <= 0.0f) {
+        return;
+    }
     int fb_width = (int)(drawData->DisplaySize.x * drawData->FramebufferScale.x);
     int fb_height = (int)(drawData->DisplaySize.y * drawData->FramebufferScale.y);
-    if (screen_texture->width() != fb_width || screen_texture->height() != fb_height) {
-        return;
+    if ((int)screen_texture->width() != fb_width || (int)screen_texture->height() != fb_height) {
+        static unsigned sMismatchLogs = 0;
+        if (sMismatchLogs < 20 || (sMismatchLogs % 600) == 0) {
+            fprintf(stderr, "[metal-diag] imgui size mismatch: drawable=%lux%lu imgui=%dx%d (display %.1fx%.1f scale %.3f) -> rescaled\n",
+                    (unsigned long)screen_texture->width(), (unsigned long)screen_texture->height(), fb_width,
+                    fb_height, drawData->DisplaySize.x, drawData->DisplaySize.y, drawData->FramebufferScale.x);
+        }
+        sMismatchLogs++;
+        drawData->FramebufferScale =
+            ImVec2((float)screen_texture->width() / drawData->DisplaySize.x,
+                   (float)screen_texture->height() / drawData->DisplaySize.y);
     }
 
     if (!framebuffer.mCommandBuffer || !framebuffer.mCommandEncoder) {
@@ -526,7 +590,30 @@ void GfxRenderingAPIMetal::DrawTriangles(float buf_vbo[], size_t buf_vbo_len, si
     }
 
     MTL::Buffer* vertex_buffer = mVertexBufferPool[mCurrentVertexBufferPoolIndex];
-    memcpy((char*)vertex_buffer->contents() + mCurrentVertexBufferOffset, buf_vbo, sizeof(float) * buf_vbo_len);
+    const size_t vboBytes = sizeof(float) * buf_vbo_len;
+    // The pool buffers are a fixed ~4.9 MB and nothing stopped the running offset from passing
+    // the end: the memcpy then wrote past the buffer and the GPU read past it (a faulted render
+    // pass -> GPU timeout). When a draw would not fit, swap in a buffer twice the size for this
+    // slot. In-flight command buffers retain the old one until they complete, and every
+    // framebuffer is told to rebind so no encoder keeps offsetting into the old buffer.
+    if (mCurrentVertexBufferOffset + vboBytes > vertex_buffer->length()) {
+        size_t newLen = std::max<size_t>(vertex_buffer->length() * 2, mCurrentVertexBufferOffset + vboBytes);
+        static unsigned sGrowLogs = 0;
+        if (sGrowLogs++ < 10) {
+            fprintf(stderr, "[metal-diag] vertex buffer slot %zu overflow at offset %zu (+%zu, cap %lu) -> grown to %zu\n",
+                    (size_t)mCurrentVertexBufferPoolIndex, (size_t)mCurrentVertexBufferOffset, vboBytes,
+                    (unsigned long)vertex_buffer->length(), newLen);
+        }
+        MTL::Buffer* grown = mDevice->newBuffer(newLen, MTL::ResourceStorageModeShared);
+        vertex_buffer->release();
+        mVertexBufferPool[mCurrentVertexBufferPoolIndex] = grown;
+        vertex_buffer = grown;
+        mCurrentVertexBufferOffset = 0;
+        for (auto& fb : mFramebuffers) {
+            fb.mHasBoundVertexShader = false;
+        }
+    }
+    memcpy((char*)vertex_buffer->contents() + mCurrentVertexBufferOffset, buf_vbo, vboBytes);
 
     if (!current_framebuffer.mHasBoundVertexShader) {
         current_framebuffer.mCommandEncoder->setVertexBuffer(vertex_buffer, 0, 0);
@@ -609,7 +696,81 @@ void GfxRenderingAPIMetal::StartFrame() {
     mFrameAutoreleasePool = NS::AutoreleasePool::alloc()->init();
 }
 
+// The CAMetalLayer is non-opaque (see MetalInit) so macOS keeps compositing it in full screen.
+// The N64 output often carries alpha < 1 (sky, fog, HUD text), which the compositor would then
+// blend with whatever is behind the window: translucent buildings, ghosted HUD text. This pass
+// writes alpha = 1 over the whole drawable (alpha channel only) just before present.
+static void GdxForceScreenOpaque(MTL::Device* device, MTL::RenderCommandEncoder* encoder,
+                                 MTL::RenderPassDescriptor* passDesc, MTL::Texture* target) {
+    static MTL::RenderPipelineState* sPipeline = nullptr;
+    static MTL::PixelFormat sColorFmt = MTL::PixelFormatInvalid;
+    static MTL::PixelFormat sDepthFmt = MTL::PixelFormatInvalid;
+    static MTL::DepthStencilState* sNoDepth = nullptr;
+    static MTL::Library* sLibrary = nullptr;
+    if (target == nullptr || encoder == nullptr) {
+        return;
+    }
+    MTL::Texture* depthTex = passDesc ? passDesc->depthAttachment()->texture() : nullptr;
+    MTL::PixelFormat colorFmt = target->pixelFormat();
+    MTL::PixelFormat depthFmt = depthTex ? depthTex->pixelFormat() : MTL::PixelFormatInvalid;
+    if (sLibrary == nullptr) {
+        static const char* kSrc = R"(
+#include <metal_stdlib>
+using namespace metal;
+vertex float4 gdx_opaque_vs(uint vid [[vertex_id]]) {
+    float2 p = float2(vid == 2 ? 3.0 : -1.0, vid == 1 ? 3.0 : -1.0);
+    return float4(p, 0.0, 1.0);
+}
+fragment float4 gdx_opaque_fs() { return float4(0.0, 0.0, 0.0, 1.0); }
+)";
+        NS::Error* err = nullptr;
+        sLibrary = device->newLibrary(NS::String::string(kSrc, NS::UTF8StringEncoding), nullptr, &err);
+        if (sLibrary == nullptr) {
+            fprintf(stderr, "[metal-diag] force-opaque shader failed to compile\n");
+            return;
+        }
+        MTL::DepthStencilDescriptor* dd = MTL::DepthStencilDescriptor::alloc()->init();
+        dd->setDepthCompareFunction(MTL::CompareFunctionAlways);
+        dd->setDepthWriteEnabled(false);
+        sNoDepth = device->newDepthStencilState(dd);
+        dd->release();
+    }
+    if (sPipeline == nullptr || colorFmt != sColorFmt || depthFmt != sDepthFmt) {
+        if (sPipeline != nullptr) {
+            sPipeline->release();
+            sPipeline = nullptr;
+        }
+        MTL::Function* vs = sLibrary->newFunction(NS::String::string("gdx_opaque_vs", NS::UTF8StringEncoding));
+        MTL::Function* fs = sLibrary->newFunction(NS::String::string("gdx_opaque_fs", NS::UTF8StringEncoding));
+        MTL::RenderPipelineDescriptor* pd = MTL::RenderPipelineDescriptor::alloc()->init();
+        pd->setVertexFunction(vs);
+        pd->setFragmentFunction(fs);
+        pd->colorAttachments()->object(0)->setPixelFormat(colorFmt);
+        pd->colorAttachments()->object(0)->setWriteMask(MTL::ColorWriteMaskAlpha);
+        pd->setDepthAttachmentPixelFormat(depthFmt);
+        NS::Error* err = nullptr;
+        sPipeline = device->newRenderPipelineState(pd, &err);
+        pd->release();
+        vs->release();
+        fs->release();
+        sColorFmt = colorFmt;
+        sDepthFmt = depthFmt;
+        if (sPipeline == nullptr) {
+            fprintf(stderr, "[metal-diag] force-opaque pipeline failed\n");
+            return;
+        }
+    }
+    MTL::Viewport vp = { 0.0, 0.0, (double)target->width(), (double)target->height(), 0.0, 1.0 };
+    MTL::ScissorRect sr = { 0, 0, target->width(), target->height() };
+    encoder->setViewport(vp);
+    encoder->setScissorRect(sr);
+    encoder->setRenderPipelineState(sPipeline);
+    encoder->setDepthStencilState(sNoDepth);
+    encoder->drawPrimitives(MTL::PrimitiveTypeTriangle, NS::UInteger(0), NS::UInteger(3));
+}
+
 void GfxRenderingAPIMetal::EndFrame() {
+    std::vector<MTL::CommandBuffer*> readbackQueueBuffers;
     std::set<int>::iterator it = mDrawnFramebuffers.begin();
     it++;
 
@@ -619,18 +780,40 @@ void GfxRenderingAPIMetal::EndFrame() {
         if (!framebuffer.mHasEndedEncoding)
             framebuffer.mCommandEncoder->endEncoding();
 
-        // GPU-side sync: signal the event after this FB's work completes.
-        // The screen framebuffer (fb=0) has a matching wait encoded before
-        // its render pass, so it won't read this FB's texture until done.
-        framebuffer.mCommandBuffer->encodeSignalEvent(mFrameSyncEvent, mFrameSyncValue);
-        mFrameSyncSignalEncoded = true;
+        // Sync with the screen framebuffer:
+        //  - mCommandQueue buffers were enqueued when they started drawing and execute in that
+        //    order; Metal's hazard tracking makes a later buffer that samples their textures wait.
+        //  - A readback-queue buffer gets no cross-queue tracking, and the screen may sample its
+        //    texture, so it is waited for on the CPU before the screen is committed. FBs only sit
+        //    on that queue for a short grace period after a CPU readback (see the cleanup below),
+        //    so this wait does not persist.
+        //
+        // History: a GPU MTL::Event wait on the screen buffer intermittently never got its signal;
+        // the GPU timed out every frame from car select on, then macOS ignored the app's
+        // submissions (black/frozen picture, and in full screen a WindowServer lockup). With no
+        // sync at all the screen showed half-drawn readback-queue FBs (flicker). A permanent
+        // readback-queue assignment plus this CPU wait was correct but slow.
+        framebuffer.mCommandBuffer->addCompletedHandler(
+            [](MTL::CommandBuffer* cb) { GdxReportCommandBufferFailure(cb); });
         framebuffer.mCommandBuffer->commit();
+        if (framebuffer.mUseReadbackQueue) {
+            readbackQueueBuffers.push_back(framebuffer.mCommandBuffer);
+        }
         it++;
+    }
+    // Wait only after EVERY offscreen buffer is committed: a readback-queue buffer can depend
+    // (via hazard tracking) on a main-queue buffer, which must be submitted first or the wait
+    // never finishes.
+    for (MTL::CommandBuffer* cb : readbackQueueBuffers) {
+        cb->waitUntilCompleted();
     }
 
     auto& screen_framebuffer = mFramebuffers[0];
-    if (!screen_framebuffer.mHasEndedEncoding)
+    if (!screen_framebuffer.mHasEndedEncoding) {
+        GdxForceScreenOpaque(mDevice, screen_framebuffer.mCommandEncoder, screen_framebuffer.mRenderPassDescriptor,
+                             mCurrentDrawable ? mCurrentDrawable->texture() : nullptr);
         screen_framebuffer.mCommandEncoder->endEncoding();
+    }
 
     // Deferred screen FB readback: blit the rendered texture into a shared
     // MTLBuffer using a blit encoder (cheap DMA — no render pass boundary,
@@ -638,8 +821,31 @@ void GfxRenderingAPIMetal::EndFrame() {
     // ReadFramebufferToCPU and converts BGRA8 → RGBA5551 on the CPU side.
     if (mScreenReadbackRequested) {
         MTL::Texture* screenTex = mTextures[screen_framebuffer.mTextureId].texture;
+        {
+            static unsigned sScreenReadLogs = 0;
+            if (sScreenReadLogs < 5 || (sScreenReadLogs % 600) == 0) {
+                fprintf(stderr, "[metal-diag] screen readback blit %ux%u from drawable %lux%lu (#%u)\n",
+                        mScreenReadbackWidth, mScreenReadbackHeight, (unsigned long)screenTex->width(),
+                        (unsigned long)screenTex->height(), sScreenReadLogs);
+            }
+            sScreenReadLogs++;
+        }
         uint32_t w = mScreenReadbackWidth;
         uint32_t h = mScreenReadbackHeight;
+        // A blit region outside the source texture invalidates the whole command buffer, so the
+        // frame (and its present) silently never happens. Clamp to the drawable.
+        if (w > screenTex->width() || h > screenTex->height()) {
+            static unsigned sClampLogs = 0;
+            if (sClampLogs < 20 || (sClampLogs % 600) == 0) {
+                fprintf(stderr, "[metal-diag] screen readback %ux%u exceeds drawable %lux%lu -> clamped\n", w, h,
+                        (unsigned long)screenTex->width(), (unsigned long)screenTex->height());
+            }
+            sClampLogs++;
+            w = std::min<uint32_t>(w, (uint32_t)screenTex->width());
+            h = std::min<uint32_t>(h, (uint32_t)screenTex->height());
+            mScreenReadbackWidth = w;
+            mScreenReadbackHeight = h;
+        }
         size_t bytesPerRow = w * 4; // BGRA8 = 4 bytes per pixel
         size_t bufSize = bytesPerRow * h;
 
@@ -651,6 +857,7 @@ void GfxRenderingAPIMetal::EndFrame() {
         }
 
         MTL::BlitCommandEncoder* blit = screen_framebuffer.mCommandBuffer->blitCommandEncoder();
+        blit->setLabel(NS::String::string("EndFrame blit", NS::UTF8StringEncoding));
         blit->copyFromTexture(screenTex, 0, 0, MTL::Origin(0, 0, 0), MTL::Size(w, h, 1), mScreenReadbackBuffer, 0,
                               bytesPerRow, bufSize);
         blit->endEncoding();
@@ -660,19 +867,9 @@ void GfxRenderingAPIMetal::EndFrame() {
         mScreenReadbackRequested = false;
     }
 
-    // Deadlock guard: if the screen framebuffer encoded a wait but no offscreen command buffer
-    // signalled it (e.g. the only offscreen FB was committed early by ReadFramebufferToCPU and
-    // erased from mDrawnFramebuffers), the screen would wait forever and hang the GPU -- in full
-    // screen that stalls WindowServer and freezes the whole Mac. Signal from the readback queue,
-    // which the waiting screen buffer on mCommandQueue cannot block.
-    if (mScreenSyncWaitEncoded && !mFrameSyncSignalEncoded && mFrameSyncEvent) {
-        MTL::CommandBuffer* signal_cb = mReadbackQueue->commandBuffer();
-        signal_cb->setLabel(NS::String::string("Frame Sync Fallback Signal", NS::UTF8StringEncoding));
-        signal_cb->encodeSignalEvent(mFrameSyncEvent, mFrameSyncValue);
-        signal_cb->commit();
-        mFrameSyncSignalEncoded = true;
-    }
-
+    // Diagnostics: a failed command buffer never presents, which looks like a black screen while
+    // the game keeps running. Report the first few failures and then one in 600.
+    screen_framebuffer.mCommandBuffer->addCompletedHandler([](MTL::CommandBuffer* cb) { GdxReportCommandBufferFailure(cb); });
     screen_framebuffer.mCommandBuffer->presentDrawable(mCurrentDrawable);
     mCurrentVertexBufferPoolIndex = (mCurrentVertexBufferPoolIndex + 1) % kMaxVertexBufferPoolSize;
     screen_framebuffer.mCommandBuffer->commit();
@@ -693,6 +890,7 @@ void GfxRenderingAPIMetal::EndFrame() {
     }
 
     mDrawnFramebuffers.clear();
+    mEnqueueOrder.clear();
 
     // Cleanup states
     for (int fb_id = 0; fb_id < (int)mFramebuffers.size(); fb_id++) {
@@ -700,6 +898,14 @@ void GfxRenderingAPIMetal::EndFrame() {
 
         fb.mLastShaderProgram = nullptr;
         fb.mCommandBuffer = nullptr;
+        // Return an FB to the in-order main queue once it hasn't been read back for a while.
+        if (fb.mUseReadbackQueue) {
+            if (fb.mReadbackQueueFrames > 0) {
+                fb.mReadbackQueueFrames--;
+            } else {
+                fb.mUseReadbackQueue = false;
+            }
+        }
         fb.mCommandEncoder = nullptr;
         fb.mHasEndedEncoding = false;
         fb.mHasBoundVertexShader = false;
@@ -742,8 +948,38 @@ int GfxRenderingAPIMetal::CreateFramebuffer() {
 }
 
 void GfxRenderingAPIMetal::SetupScreenFramebuffer(uint32_t width, uint32_t height) {
-    mCurrentDrawable = nullptr;
+    // Own the drawable for the whole frame. nextDrawable() returns an autoreleased object and it was
+    // never retained, so an autorelease pool draining mid-frame could free the drawable (and its
+    // texture) while the screen render pass still targeted it -- the screen's first, otherwise
+    // empty, pass then faulted on freed memory (GPU timeout every frame, black screen,
+    // WindowServer lockup). Windowed mode masked it because the window server held its own
+    // reference; in full screen the drawable goes straight to the display.
+    if (mCurrentDrawable != nullptr) {
+        mCurrentDrawable->release();
+    }
     mCurrentDrawable = mLayer->nextDrawable();
+    if (mCurrentDrawable != nullptr) {
+        mCurrentDrawable->retain();
+    }
+
+    // Size the screen framebuffer (texture bookkeeping, depth buffer, scissor clamping) from the
+    // drawable we actually got, not the SDL output size we asked for. In full screen they can
+    // differ; a depth attachment or scissor rect that doesn't match the real render target hung
+    // the screen's first render pass (GPU timeout, black screen, WindowServer lockup).
+    if (mCurrentDrawable != nullptr) {
+        uint32_t dw = (uint32_t)mCurrentDrawable->texture()->width();
+        uint32_t dh = (uint32_t)mCurrentDrawable->texture()->height();
+        if (dw != width || dh != height) {
+            static unsigned sSizeLogs = 0;
+            if (sSizeLogs < 10 || (sSizeLogs % 600) == 0) {
+                fprintf(stderr, "[metal-diag] drawable %ux%u differs from requested %ux%u -> using drawable\n", dw, dh,
+                        width, height);
+            }
+            sSizeLogs++;
+            width = dw;
+            height = dh;
+        }
+    }
 
     bool msaa_enabled = Ship::Context::GetInstance()->GetConsoleVariables()->GetInteger("gMSAAValue", 1) > 1;
 
@@ -955,21 +1191,7 @@ void GfxRenderingAPIMetal::StartDrawToFramebuffer(int fb_id, float noise_scale) 
         if (!fb.mUseReadbackQueue) {
             // Queue the command buffers in order of start draw
             fb.mCommandBuffer->enqueue();
-        }
-
-        // Track whether any offscreen FB was drawn this frame.
-        if (fb_id != 0) {
-            mOffscreenFbActive = true;
-        }
-
-        // GPU-side sync: make the screen framebuffer wait for offscreen FBs
-        // to finish rendering before its render pass reads their textures.
-        // Only wait when an offscreen FB was actually drawn this frame;
-        // otherwise (e.g. logo screen) there is no matching signal and
-        // the GPU would deadlock.
-        if (fb_id == 0 && mFrameSyncEvent && mOffscreenFbActive) {
-            fb.mCommandBuffer->encodeWait(mFrameSyncEvent, mFrameSyncValue);
-            mScreenSyncWaitEncoded = true;
+            mEnqueueOrder.push_back(fb_id);
         }
 
         fb.mCommandEncoder = fb.mCommandBuffer->renderCommandEncoder(fb.mRenderPassDescriptor);
@@ -1012,6 +1234,7 @@ void GfxRenderingAPIMetal::ClearFramebuffer(bool color, bool depth) {
 
     // Create a new render encoder back onto the framebuffer
     framebuffer.mCommandEncoder = framebuffer.mCommandBuffer->renderCommandEncoder(framebuffer.mRenderPassDescriptor);
+    framebuffer.mCommandEncoder->setLabel(NS::String::string("ClearFramebuffer render", NS::UTF8StringEncoding));
 
     std::string fbce_label = fmt::format("FrameBuffer {} Command Encoder After Clear", mCurrentFramebuffer);
     framebuffer.mCommandEncoder->setLabel(NS::String::string(fbce_label.c_str(), NS::UTF8StringEncoding));
@@ -1060,6 +1283,7 @@ void GfxRenderingAPIMetal::ResolveMSAAColorBuffer(int fb_id_target, int fb_id_so
         source_framebuffer.mHasEndedEncoding = true;
 
         MTL::BlitCommandEncoder* blit_encoder = source_framebuffer.mCommandBuffer->blitCommandEncoder();
+        blit_encoder->setLabel(NS::String::string("ResolveMSAAColorBuffer blit", NS::UTF8StringEncoding));
         blit_encoder->setLabel(NS::String::string("MSAA Copy Encoder", NS::UTF8StringEncoding));
         blit_encoder->copyFromTexture(source_texture, target_texture);
         blit_encoder->endEncoding();
@@ -1070,6 +1294,7 @@ void GfxRenderingAPIMetal::ResolveMSAAColorBuffer(int fb_id_target, int fb_id_so
 
         // Create a blit encoder
         MTL::BlitCommandEncoder* blit_encoder = target_framebuffer.mCommandBuffer->blitCommandEncoder();
+        blit_encoder->setLabel(NS::String::string("ResolveMSAAColorBuffer blit", NS::UTF8StringEncoding));
         blit_encoder->setLabel(NS::String::string("MSAA Copy Encoder", NS::UTF8StringEncoding));
 
         // Copy the texture over using the origins and size
@@ -1130,6 +1355,7 @@ GfxRenderingAPIMetal::GetPixelDepth(int fb_id, const std::set<std::pair<float, f
     MTL::ComputePipelineState* compute_pipeline_state = mDevice->newComputePipelineState(mDepthComputeFunction, &error);
 
     MTL::ComputeCommandEncoder* compute_encoder = command_buffer->computeCommandEncoder();
+    compute_encoder->setLabel(NS::String::string("ResolveMSAAColorBuffer compute", NS::UTF8StringEncoding));
     compute_encoder->setComputePipelineState(compute_pipeline_state);
     compute_encoder->setTexture(framebuffer.mDepthTexture, 0);
     compute_encoder->setBuffer(mCoordUniformBuffer, 0, 0);
@@ -1191,6 +1417,14 @@ void GfxRenderingAPIMetal::CopyFramebuffer(int fb_dst_id, int fb_src_id, int src
         return;
     }
 
+    if (fb_src_id == 0) {
+        static unsigned sScreenCopyLogs = 0;
+        if (sScreenCopyLogs < 5 || (sScreenCopyLogs % 600) == 0) {
+            fprintf(stderr, "[metal-diag] CopyFramebuffer from the screen drawable -> fb %d (#%u)\n", fb_dst_id,
+                    sScreenCopyLogs);
+        }
+        sScreenCopyLogs++;
+    }
     int source_texture_id = source_framebuffer.mTextureId;
     MTL::Texture* source_texture = mTextures[source_texture_id].texture;
 
@@ -1202,6 +1436,7 @@ void GfxRenderingAPIMetal::CopyFramebuffer(int fb_dst_id, int fb_src_id, int src
 
     // Create a blit encoder
     MTL::BlitCommandEncoder* blit_encoder = source_framebuffer.mCommandBuffer->blitCommandEncoder();
+    blit_encoder->setLabel(NS::String::string("CopyFramebuffer blit", NS::UTF8StringEncoding));
     blit_encoder->setLabel(NS::String::string("Copy Framebuffer Encoder", NS::UTF8StringEncoding));
 
     MTL::Origin source_origin = MTL::Origin(srcX0, srcY0, 0);
@@ -1295,6 +1530,41 @@ void GfxRenderingAPIMetal::ReadFramebufferToCPU(int fb_id, uint32_t width, uint3
             framebuffer.mCommandEncoder->endEncoding();
         }
 
+        // Before blocking on a readback-queue buffer, submit every main-queue offscreen buffer
+        // enqueued so far this frame (in enqueue order). The readback may depend on their output
+        // through hazard tracking; left unsubmitted until EndFrame, the CPU wait below and those
+        // buffers would wait on each other until the GPU watchdog killed the frame (GPU timeout,
+        // then macOS ignoring the app: black or frozen picture). Their framebuffers reopen with a
+        // fresh command buffer on the next draw; offscreen passes use LoadActionLoad, so contents
+        // are kept. The screen buffer cannot be flushed; that case is reported.
+        if (framebuffer.mUseReadbackQueue) {
+            for (int id : mEnqueueOrder) {
+                if (id == fb_id) {
+                    continue;
+                }
+                FramebufferMetal& other = mFramebuffers[id];
+                if (other.mCommandBuffer == nullptr || other.mUseReadbackQueue) {
+                    continue;
+                }
+                if (id == 0) {
+                    static unsigned sScreenAheadLogs = 0;
+                    if (sScreenAheadLogs++ < 10) {
+                        fprintf(stderr, "[metal-diag] readback of fb %d with the screen buffer already enqueued\n",
+                                fb_id);
+                    }
+                    break;
+                }
+                if (other.mCommandEncoder && !other.mHasEndedEncoding) {
+                    other.mCommandEncoder->endEncoding();
+                }
+                other.mCommandBuffer->commit();
+                other.mCommandBuffer = nullptr;
+                other.mCommandEncoder = nullptr;
+                other.mHasEndedEncoding = false;
+                mDrawnFramebuffers.erase(id);
+            }
+        }
+
         if (!mConvertToRgb5a1PipelineState) {
             NS::Error* pso_error = nullptr;
             mConvertToRgb5a1PipelineState = mDevice->newComputePipelineState(mConvertToRgb5a1Function, &pso_error);
@@ -1304,6 +1574,7 @@ void GfxRenderingAPIMetal::ReadFramebufferToCPU(int fb_id, uint32_t width, uint3
             mDevice->newBuffer(sizeof(uint16_t) * width * height, MTL::ResourceStorageModeShared);
 
         MTL::ComputeCommandEncoder* compute_encoder = framebuffer.mCommandBuffer->computeCommandEncoder();
+        compute_encoder->setLabel(NS::String::string("ReadFramebufferToCPU compute", NS::UTF8StringEncoding));
         compute_encoder->setComputePipelineState(mConvertToRgb5a1PipelineState);
         compute_encoder->setTexture(texture, 0);
         compute_encoder->setBuffer(output_buffer, 0, 0);
@@ -1317,14 +1588,9 @@ void GfxRenderingAPIMetal::ReadFramebufferToCPU(int fb_id, uint32_t width, uint3
         }
         compute_encoder->endEncoding();
 
-        // This FB is committed early and erased from mDrawnFramebuffers below, so EndFrame will
-        // not signal for it. Signal here, or a screen FB waiting on this frame's value deadlocks.
-        if (mFrameSyncEvent) {
-            framebuffer.mCommandBuffer->encodeSignalEvent(mFrameSyncEvent, mFrameSyncValue);
-            mFrameSyncSignalEncoded = true;
-        }
         framebuffer.mCommandBuffer->commit();
 
+        framebuffer.mReadbackQueueFrames = 30; // stay on the readback queue ~0.5 s after a readback
         if (framebuffer.mUseReadbackQueue) {
             framebuffer.mCommandBuffer->waitUntilCompleted();
             uint16_t* values = (uint16_t*)output_buffer->contents();

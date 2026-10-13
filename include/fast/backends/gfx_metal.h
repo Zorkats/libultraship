@@ -7,6 +7,7 @@
 #pragma once
 #ifdef __APPLE__
 
+#include <vector>
 #include "gfx_rendering_api.h"
 #include "../interpreter.h"
 
@@ -111,6 +112,9 @@ struct FramebufferMetal {
     // When true, command buffer is created on the readback queue (no enqueue ordering).
     // First ReadFramebufferToCPU returns zeros and flips this; real data from frame 2+.
     bool mUseReadbackQueue = false;
+    // Frames left on the readback queue since this FB was last read back to the CPU. When it
+    // reaches 0 the FB returns to mCommandQueue (see EndFrame).
+    int mReadbackQueueFrames = 0;
 };
 
 struct FrameUniforms {
@@ -234,8 +238,10 @@ class GfxRenderingAPIMetal final : public GfxRenderingAPI {
 
     // Current state
     struct ShaderProgramMetal* mShaderProgram;
-    CA::MetalDrawable* mCurrentDrawable;
+    CA::MetalDrawable* mCurrentDrawable = nullptr;
     std::set<int> mDrawnFramebuffers;
+    // mCommandQueue framebuffers in the order their command buffers were enqueued this frame.
+    std::vector<int> mEnqueueOrder;
     NS::AutoreleasePool* mFrameAutoreleasePool;
 
     int mCurrentTile;

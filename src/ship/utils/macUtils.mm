@@ -3,6 +3,7 @@
 #import "ship/utils/macUtils.h"
 #import <SDL_syswm.h>
 #import <Cocoa/Cocoa.h>
+#import <QuartzCore/QuartzCore.h>
 
 //Just a simple function to toggle the native macOS fullscreen.
 void toggleNativeMacOSFullscreen(SDL_Window *window) {
@@ -24,5 +25,10 @@ bool isNativeMacOSFullscreenActive(SDL_Window *window) {
         return (([nswindow styleMask] & NSWindowStyleMaskFullScreen) == NSWindowStyleMaskFullScreen);
     }
     return false;
+}
+void setMetalLayerOpaque(void* metalLayer, bool opaque) {
+    if (metalLayer != nullptr) {
+        [(CALayer*)metalLayer setOpaque:opaque ? YES : NO];
+    }
 }
 #endif
