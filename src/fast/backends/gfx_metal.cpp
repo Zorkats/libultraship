@@ -786,6 +786,9 @@ void GfxRenderingAPIMetal::SetupScreenFramebuffer(uint32_t width, uint32_t heigh
 void GfxRenderingAPIMetal::UpdateFramebufferParameters(int fb_id, uint32_t width, uint32_t height, uint32_t msaa_level,
                                                        bool opengl_invertY, bool render_target, bool has_depth_buffer,
                                                        bool can_extract_depth, GdxFramebufferFormat format) {
+    // TODO(metal): `format` is not honoured yet. Framebuffers stay 8-bit BGRA (the sRGB variant when
+    // mSrgbMode is set), so R16G16B16A16_FLOAT requests fall back to 8-bit. OpenGL and D3D11 honour it.
+    (void)format;
     // Screen framebuffer is handled separately on a frame by frame basis
     // see `SetupScreenFramebuffer`.
     if (fb_id == 0) {
@@ -1163,6 +1166,13 @@ void GfxRenderingAPIMetal::CopyFramebuffer(int fb_dst_id, int fb_src_id, int src
     }
 
     FramebufferMetal& source_framebuffer = mFramebuffers[fb_src_id];
+
+    // The copy is encoded into the source framebuffer's command buffer, which only exists once that
+    // framebuffer has started drawing this frame. A copy from an idle framebuffer (for example a
+    // held frame with no GFX task) would dereference a null encoder, so skip it.
+    if (source_framebuffer.mCommandBuffer == nullptr || source_framebuffer.mCommandEncoder == nullptr) {
+        return;
+    }
 
     int source_texture_id = source_framebuffer.mTextureId;
     MTL::Texture* source_texture = mTextures[source_texture_id].texture;

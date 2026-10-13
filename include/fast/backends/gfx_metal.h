@@ -196,7 +196,6 @@ class GfxRenderingAPIMetal final : public GfxRenderingAPI {
     uint64_t mFrameSyncValue = 0;
     bool mOffscreenFbActive = false;
 
-
     int mCurrentVertexBufferPoolIndex = 0;
     MTL::Buffer* mVertexBufferPool[kMaxVertexBufferPoolSize];
     std::unordered_map<std::pair<uint64_t, uint32_t>, struct ShaderProgramMetal, hash_pair_shader_ids>
