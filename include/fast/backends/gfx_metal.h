@@ -242,6 +242,9 @@ class GfxRenderingAPIMetal final : public GfxRenderingAPI {
     std::set<int> mDrawnFramebuffers;
     // mCommandQueue framebuffers in the order their command buffers were enqueued this frame.
     std::vector<int> mEnqueueOrder;
+    // Command buffers committed by the last EndFrame (retained). Reading an FB that has not been
+    // drawn this frame waits on these, then reads on the readback queue: see ReadFramebufferToCPU.
+    std::vector<MTL::CommandBuffer*> mLastFrameCmdBufs;
     NS::AutoreleasePool* mFrameAutoreleasePool;
 
     int mCurrentTile;

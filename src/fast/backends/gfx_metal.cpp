@@ -14,6 +14,7 @@
 #include "ship/utils/macUtils.h"
 
 #include <vector>
+#include <map>
 #include <algorithm>
 #include <unordered_map>
 #include <queue>
@@ -771,6 +772,7 @@ fragment float4 gdx_opaque_fs() { return float4(0.0, 0.0, 0.0, 1.0); }
 
 void GfxRenderingAPIMetal::EndFrame() {
     std::vector<MTL::CommandBuffer*> readbackQueueBuffers;
+    std::vector<MTL::CommandBuffer*> frameCmdBufs;
     std::set<int>::iterator it = mDrawnFramebuffers.begin();
     it++;
 
@@ -796,6 +798,7 @@ void GfxRenderingAPIMetal::EndFrame() {
         framebuffer.mCommandBuffer->addCompletedHandler(
             [](MTL::CommandBuffer* cb) { GdxReportCommandBufferFailure(cb); });
         framebuffer.mCommandBuffer->commit();
+        frameCmdBufs.push_back(framebuffer.mCommandBuffer->retain());
         if (framebuffer.mUseReadbackQueue) {
             readbackQueueBuffers.push_back(framebuffer.mCommandBuffer);
         }
@@ -873,6 +876,11 @@ void GfxRenderingAPIMetal::EndFrame() {
     screen_framebuffer.mCommandBuffer->presentDrawable(mCurrentDrawable);
     mCurrentVertexBufferPoolIndex = (mCurrentVertexBufferPoolIndex + 1) % kMaxVertexBufferPoolSize;
     screen_framebuffer.mCommandBuffer->commit();
+    frameCmdBufs.push_back(screen_framebuffer.mCommandBuffer->retain());
+    for (MTL::CommandBuffer* cb : mLastFrameCmdBufs) {
+        cb->release();
+    }
+    mLastFrameCmdBufs.swap(frameCmdBufs);
 
     // Now that commit has been called, retain the command buffer for GPU sync
     // in ReadFramebufferToCPU next frame (waitUntilCompleted before reading).
@@ -1402,6 +1410,115 @@ void GfxRenderingAPIMetal::SelectTextureFb(int fb_id) {
     SelectTexture(tile, mFramebuffers[fb_id].mTextureId);
 }
 
+// Scaled framebuffer copy. A blit (copyFromTexture) can only copy same-size regions, so when the
+// source and destination rects differ -- e.g. the window-sized game framebuffer into the 320x240
+// transition-snapshot mirror -- the blit ran off the end of the destination and the mirror never
+// got real pixels (menu transitions cut to black). This draws a textured triangle instead.
+static void GdxScaledCopy(MTL::Device* device, MTL::CommandBuffer* cmdBuf, MTL::Texture* src, MTL::Texture* dst,
+                          int srcX0, int srcY0, int srcX1, int srcY1, int dstX0, int dstY0, int dstX1, int dstY1) {
+    static MTL::Library* sLibrary = nullptr;
+    static std::map<MTL::PixelFormat, MTL::RenderPipelineState*> sPipelines;
+    if (src == nullptr || dst == nullptr || cmdBuf == nullptr) {
+        return;
+    }
+    if (src->sampleCount() > 1 || dst->sampleCount() > 1 || !(src->usage() & MTL::TextureUsageShaderRead) ||
+        !(dst->usage() & MTL::TextureUsageRenderTarget)) {
+        static unsigned sSkipLogs = 0;
+        if (sSkipLogs++ < 5) {
+            fprintf(stderr, "[metal-diag] scaled copy skipped (src samples=%lu, dst samples=%lu)\n",
+                    (unsigned long)src->sampleCount(), (unsigned long)dst->sampleCount());
+        }
+        return;
+    }
+    if (sLibrary == nullptr) {
+        static const char* kSrc = R"(
+#include <metal_stdlib>
+using namespace metal;
+struct VOut { float4 pos [[position]]; float2 uv; };
+vertex VOut gdx_scopy_vs(uint vid [[vertex_id]]) {
+    float2 p = float2(vid == 2 ? 3.0 : -1.0, vid == 1 ? 3.0 : -1.0);
+    VOut o;
+    o.pos = float4(p, 0.0, 1.0);
+    o.uv = float2(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5);
+    return o;
+}
+fragment float4 gdx_scopy_fs(VOut in [[stage_in]], texture2d<float> tex [[texture(0)]],
+                             constant float4& rect [[buffer(0)]]) {
+    constexpr sampler s(coord::normalized, filter::linear, address::clamp_to_edge);
+    return tex.sample(s, mix(rect.xy, rect.zw, in.uv));
+}
+)";
+        NS::Error* err = nullptr;
+        sLibrary = device->newLibrary(NS::String::string(kSrc, NS::UTF8StringEncoding), nullptr, &err);
+        if (sLibrary == nullptr) {
+            fprintf(stderr, "[metal-diag] scaled-copy shader failed to compile\n");
+            return;
+        }
+    }
+    MTL::PixelFormat fmt = dst->pixelFormat();
+    MTL::RenderPipelineState* pipeline = nullptr;
+    auto found = sPipelines.find(fmt);
+    if (found != sPipelines.end()) {
+        pipeline = found->second;
+    } else {
+        MTL::Function* vs = sLibrary->newFunction(NS::String::string("gdx_scopy_vs", NS::UTF8StringEncoding));
+        MTL::Function* fs = sLibrary->newFunction(NS::String::string("gdx_scopy_fs", NS::UTF8StringEncoding));
+        MTL::RenderPipelineDescriptor* pd = MTL::RenderPipelineDescriptor::alloc()->init();
+        pd->setVertexFunction(vs);
+        pd->setFragmentFunction(fs);
+        pd->colorAttachments()->object(0)->setPixelFormat(fmt);
+        NS::Error* err = nullptr;
+        pipeline = device->newRenderPipelineState(pd, &err);
+        pd->release();
+        vs->release();
+        fs->release();
+        sPipelines[fmt] = pipeline;
+        if (pipeline == nullptr) {
+            fprintf(stderr, "[metal-diag] scaled-copy pipeline failed\n");
+        }
+    }
+    if (pipeline == nullptr) {
+        return;
+    }
+    // Normalise a flipped destination rect by flipping the source instead.
+    if (dstX1 < dstX0) {
+        std::swap(dstX0, dstX1);
+        std::swap(srcX0, srcX1);
+    }
+    if (dstY1 < dstY0) {
+        std::swap(dstY0, dstY1);
+        std::swap(srcY0, srcY1);
+    }
+    const int dw = (int)dst->width();
+    const int dh = (int)dst->height();
+    const int cx0 = std::max(0, std::min(dstX0, dw));
+    const int cy0 = std::max(0, std::min(dstY0, dh));
+    const int cx1 = std::max(0, std::min(dstX1, dw));
+    const int cy1 = std::max(0, std::min(dstY1, dh));
+    if (cx1 <= cx0 || cy1 <= cy0) {
+        return;
+    }
+    const float sw = (float)src->width();
+    const float sh = (float)src->height();
+    float rect[4] = { srcX0 / sw, srcY0 / sh, srcX1 / sw, srcY1 / sh };
+
+    MTL::RenderPassDescriptor* rp = MTL::RenderPassDescriptor::renderPassDescriptor();
+    rp->colorAttachments()->object(0)->setTexture(dst);
+    rp->colorAttachments()->object(0)->setLoadAction(MTL::LoadActionLoad);
+    rp->colorAttachments()->object(0)->setStoreAction(MTL::StoreActionStore);
+    MTL::RenderCommandEncoder* enc = cmdBuf->renderCommandEncoder(rp);
+    enc->setLabel(NS::String::string("CopyFramebuffer scaled", NS::UTF8StringEncoding));
+    MTL::Viewport vp = { (double)dstX0, (double)dstY0, (double)(dstX1 - dstX0), (double)(dstY1 - dstY0), 0.0, 1.0 };
+    MTL::ScissorRect sr = { (NS::UInteger)cx0, (NS::UInteger)cy0, (NS::UInteger)(cx1 - cx0), (NS::UInteger)(cy1 - cy0) };
+    enc->setViewport(vp);
+    enc->setScissorRect(sr);
+    enc->setRenderPipelineState(pipeline);
+    enc->setFragmentTexture(src, 0);
+    enc->setFragmentBytes(rect, sizeof(rect), 0);
+    enc->drawPrimitives(MTL::PrimitiveTypeTriangle, NS::UInteger(0), NS::UInteger(3));
+    enc->endEncoding();
+}
+
 void GfxRenderingAPIMetal::CopyFramebuffer(int fb_dst_id, int fb_src_id, int srcX0, int srcY0, int srcX1, int srcY1,
                                            int dstX0, int dstY0, int dstX1, int dstY1) {
     if (fb_src_id >= (int)mFramebuffers.size() || fb_dst_id >= (int)mFramebuffers.size()) {
@@ -1434,19 +1551,28 @@ void GfxRenderingAPIMetal::CopyFramebuffer(int fb_dst_id, int fb_src_id, int src
     // End the current render encoder
     source_framebuffer.mCommandEncoder->endEncoding();
 
-    // Create a blit encoder
-    MTL::BlitCommandEncoder* blit_encoder = source_framebuffer.mCommandBuffer->blitCommandEncoder();
-    blit_encoder->setLabel(NS::String::string("CopyFramebuffer blit", NS::UTF8StringEncoding));
-    blit_encoder->setLabel(NS::String::string("Copy Framebuffer Encoder", NS::UTF8StringEncoding));
+    const bool sameSize = (srcX1 - srcX0) == (dstX1 - dstX0) && (srcY1 - srcY0) == (dstY1 - dstY0) &&
+                          srcX1 > srcX0 && srcY1 > srcY0;
+    if (sameSize && target_texture != nullptr && source_texture != nullptr &&
+        (NS::UInteger)dstX1 <= target_texture->width() && (NS::UInteger)dstY1 <= target_texture->height() &&
+        dstX0 >= 0 && dstY0 >= 0 && srcX0 >= 0 && srcY0 >= 0 &&
+        (NS::UInteger)srcX1 <= source_texture->width() && (NS::UInteger)srcY1 <= source_texture->height()) {
+        // Create a blit encoder
+        MTL::BlitCommandEncoder* blit_encoder = source_framebuffer.mCommandBuffer->blitCommandEncoder();
+        blit_encoder->setLabel(NS::String::string("Copy Framebuffer Encoder", NS::UTF8StringEncoding));
 
-    MTL::Origin source_origin = MTL::Origin(srcX0, srcY0, 0);
-    MTL::Origin target_origin = MTL::Origin(dstX0, dstY0, 0);
-    MTL::Size source_size = MTL::Size(srcX1 - srcX0, srcY1 - srcY0, 1);
+        MTL::Origin source_origin = MTL::Origin(srcX0, srcY0, 0);
+        MTL::Origin target_origin = MTL::Origin(dstX0, dstY0, 0);
+        MTL::Size source_size = MTL::Size(srcX1 - srcX0, srcY1 - srcY0, 1);
 
-    // Copy the texture over using the origins and size
-    blit_encoder->copyFromTexture(source_texture, 0, 0, source_origin, source_size, target_texture, 0, 0,
-                                  target_origin);
-    blit_encoder->endEncoding();
+        // Copy the texture over using the origins and size
+        blit_encoder->copyFromTexture(source_texture, 0, 0, source_origin, source_size, target_texture, 0, 0,
+                                      target_origin);
+        blit_encoder->endEncoding();
+    } else {
+        GdxScaledCopy(mDevice, source_framebuffer.mCommandBuffer, source_texture, target_texture, srcX0, srcY0, srcX1,
+                      srcY1, dstX0, dstY0, dstX1, dstY1);
+    }
 
     // Track the original load action and set the next load actions to Load to leverage the blit results
     MTL::RenderPassColorAttachmentDescriptor* srcColorAttachment =
@@ -1524,6 +1650,43 @@ void GfxRenderingAPIMetal::ReadFramebufferToCPU(int fb_id, uint32_t width, uint3
         mScreenReadbackRequested = true;
         mScreenReadbackWidth = width;
         mScreenReadbackHeight = height;
+    } else if (framebuffer.mCommandBuffer == nullptr) {
+        // Not drawn this frame (e.g. the transition-snapshot mirror, which is only ever written by
+        // copies encoded in another FB's command buffer): its texture holds what the last frame left.
+        // Every buffer from that frame is committed, so waiting on them cannot deadlock; then read on
+        // the readback queue, which nothing this frame has touched. The path below would hand back
+        // zeros on the first readback (and again after every 30-frame idle), which is exactly when a
+        // menu transition asks: the title-screen curtain cut to black.
+        for (MTL::CommandBuffer* cb : mLastFrameCmdBufs) {
+            cb->waitUntilCompleted();
+        }
+        if (texture == nullptr) {
+            memset(rgba16_buf, 0, sizeof(uint16_t) * width * height);
+            return;
+        }
+        if (!mConvertToRgb5a1PipelineState) {
+            NS::Error* pso_error = nullptr;
+            mConvertToRgb5a1PipelineState = mDevice->newComputePipelineState(mConvertToRgb5a1Function, &pso_error);
+        }
+        MTL::Buffer* output_buffer =
+            mDevice->newBuffer(sizeof(uint16_t) * width * height, MTL::ResourceStorageModeShared);
+        MTL::CommandBuffer* cb = mReadbackQueue->commandBuffer();
+        MTL::ComputeCommandEncoder* compute_encoder = cb->computeCommandEncoder();
+        compute_encoder->setLabel(NS::String::string("ReadFramebufferToCPU idle-FB compute", NS::UTF8StringEncoding));
+        compute_encoder->setComputePipelineState(mConvertToRgb5a1PipelineState);
+        compute_encoder->setTexture(texture, 0);
+        compute_encoder->setBuffer(output_buffer, 0, 0);
+        MTL::Size tg = MTL::Size::Make(8, 8, 1);
+        if (mNonUniformThreadgroupSupported) {
+            compute_encoder->dispatchThreads(MTL::Size::Make(width, height, 1), tg);
+        } else {
+            compute_encoder->dispatchThreadgroups(MTL::Size::Make((width + 7) / 8, (height + 7) / 8, 1), tg);
+        }
+        compute_encoder->endEncoding();
+        cb->commit();
+        cb->waitUntilCompleted();
+        memcpy(rgba16_buf, output_buffer->contents(), sizeof(uint16_t) * width * height);
+        output_buffer->release();
     } else {
         // Custom Framebuffer: synchronous readback via readback queue
         if (framebuffer.mCommandEncoder && !framebuffer.mHasEndedEncoding) {
