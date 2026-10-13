@@ -589,6 +589,8 @@ void GfxRenderingAPIMetal::OnResize() {
 void GfxRenderingAPIMetal::StartFrame() {
     mFrameSyncValue++;
     mOffscreenFbActive = false;
+    mScreenSyncWaitEncoded = false;
+    mFrameSyncSignalEncoded = false;
     mFrameUniforms.frameCount++;
     if (mFrameUniforms.frameCount > 150) {
         // No high values, as noise starts to look ugly
@@ -621,6 +623,7 @@ void GfxRenderingAPIMetal::EndFrame() {
         // The screen framebuffer (fb=0) has a matching wait encoded before
         // its render pass, so it won't read this FB's texture until done.
         framebuffer.mCommandBuffer->encodeSignalEvent(mFrameSyncEvent, mFrameSyncValue);
+        mFrameSyncSignalEncoded = true;
         framebuffer.mCommandBuffer->commit();
         it++;
     }
@@ -655,6 +658,19 @@ void GfxRenderingAPIMetal::EndFrame() {
         // Don't set mScreenReadbackDataReady yet — the blit hasn't executed.
         // Retain the command buffer so ReadFramebufferToCPU can wait on it.
         mScreenReadbackRequested = false;
+    }
+
+    // Deadlock guard: if the screen framebuffer encoded a wait but no offscreen command buffer
+    // signalled it (e.g. the only offscreen FB was committed early by ReadFramebufferToCPU and
+    // erased from mDrawnFramebuffers), the screen would wait forever and hang the GPU -- in full
+    // screen that stalls WindowServer and freezes the whole Mac. Signal from the readback queue,
+    // which the waiting screen buffer on mCommandQueue cannot block.
+    if (mScreenSyncWaitEncoded && !mFrameSyncSignalEncoded && mFrameSyncEvent) {
+        MTL::CommandBuffer* signal_cb = mReadbackQueue->commandBuffer();
+        signal_cb->setLabel(NS::String::string("Frame Sync Fallback Signal", NS::UTF8StringEncoding));
+        signal_cb->encodeSignalEvent(mFrameSyncEvent, mFrameSyncValue);
+        signal_cb->commit();
+        mFrameSyncSignalEncoded = true;
     }
 
     screen_framebuffer.mCommandBuffer->presentDrawable(mCurrentDrawable);
@@ -953,6 +969,7 @@ void GfxRenderingAPIMetal::StartDrawToFramebuffer(int fb_id, float noise_scale) 
         // the GPU would deadlock.
         if (fb_id == 0 && mFrameSyncEvent && mOffscreenFbActive) {
             fb.mCommandBuffer->encodeWait(mFrameSyncEvent, mFrameSyncValue);
+            mScreenSyncWaitEncoded = true;
         }
 
         fb.mCommandEncoder = fb.mCommandBuffer->renderCommandEncoder(fb.mRenderPassDescriptor);
@@ -1300,6 +1317,12 @@ void GfxRenderingAPIMetal::ReadFramebufferToCPU(int fb_id, uint32_t width, uint3
         }
         compute_encoder->endEncoding();
 
+        // This FB is committed early and erased from mDrawnFramebuffers below, so EndFrame will
+        // not signal for it. Signal here, or a screen FB waiting on this frame's value deadlocks.
+        if (mFrameSyncEvent) {
+            framebuffer.mCommandBuffer->encodeSignalEvent(mFrameSyncEvent, mFrameSyncValue);
+            mFrameSyncSignalEncoded = true;
+        }
         framebuffer.mCommandBuffer->commit();
 
         if (framebuffer.mUseReadbackQueue) {

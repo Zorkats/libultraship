@@ -195,6 +195,10 @@ class GfxRenderingAPIMetal final : public GfxRenderingAPI {
     MTL::Event* mFrameSyncEvent = nullptr;
     uint64_t mFrameSyncValue = 0;
     bool mOffscreenFbActive = false;
+    // True once the screen framebuffer has encoded a wait on mFrameSyncEvent this frame.
+    bool mScreenSyncWaitEncoded = false;
+    // True once any command buffer has encoded the matching signal this frame.
+    bool mFrameSyncSignalEncoded = false;
 
     int mCurrentVertexBufferPoolIndex = 0;
     MTL::Buffer* mVertexBufferPool[kMaxVertexBufferPoolSize];
