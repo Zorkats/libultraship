@@ -7,6 +7,7 @@
 #pragma once
 #ifdef __APPLE__
 
+#include <vector>
 #include "gfx_rendering_api.h"
 #include "../interpreter.h"
 
@@ -31,6 +32,7 @@ class Buffer;
 class RenderPipelineState;
 class ComputePipelineState;
 class CommandQueue;
+class Event;
 class Viewport;
 } // namespace MTL
 
@@ -110,6 +112,9 @@ struct FramebufferMetal {
     // When true, command buffer is created on the readback queue (no enqueue ordering).
     // First ReadFramebufferToCPU returns zeros and flips this; real data from frame 2+.
     bool mUseReadbackQueue = false;
+    // Frames left on the readback queue since this FB was last read back to the CPU. When it
+    // reaches 0 the FB returns to mCommandQueue (see EndFrame).
+    int mReadbackQueueFrames = 0;
 };
 
 struct FrameUniforms {
@@ -159,7 +164,8 @@ class GfxRenderingAPIMetal final : public GfxRenderingAPI {
     int CreateFramebuffer() override;
     void UpdateFramebufferParameters(int fb_id, uint32_t width, uint32_t height, uint32_t msaa_level,
                                      bool opengl_invertY, bool render_target, bool has_depth_buffer,
-                                     bool can_extract_depth) override;
+                                     bool can_extract_depth,
+                                     GdxFramebufferFormat format = GdxFramebufferFormat::R8G8B8A8_UNORM) override;
     void StartDrawToFramebuffer(int fbId, float noiseScale) override;
     void CopyFramebuffer(int fbDstId, int fbSrcId, int srcX0, int srcY0, int srcX1, int srcY1, int dstX0, int dstY0,
                          int dstX1, int dstY1) override;
@@ -190,6 +196,13 @@ class GfxRenderingAPIMetal final : public GfxRenderingAPI {
     MTL::Device* mDevice;
     MTL::CommandQueue* mCommandQueue;
     MTL::CommandQueue* mReadbackQueue;
+    MTL::Event* mFrameSyncEvent = nullptr;
+    uint64_t mFrameSyncValue = 0;
+    bool mOffscreenFbActive = false;
+    // True once the screen framebuffer has encoded a wait on mFrameSyncEvent this frame.
+    bool mScreenSyncWaitEncoded = false;
+    // True once any command buffer has encoded the matching signal this frame.
+    bool mFrameSyncSignalEncoded = false;
 
     int mCurrentVertexBufferPoolIndex = 0;
     MTL::Buffer* mVertexBufferPool[kMaxVertexBufferPoolSize];
@@ -225,8 +238,13 @@ class GfxRenderingAPIMetal final : public GfxRenderingAPI {
 
     // Current state
     struct ShaderProgramMetal* mShaderProgram;
-    CA::MetalDrawable* mCurrentDrawable;
+    CA::MetalDrawable* mCurrentDrawable = nullptr;
     std::set<int> mDrawnFramebuffers;
+    // mCommandQueue framebuffers in the order their command buffers were enqueued this frame.
+    std::vector<int> mEnqueueOrder;
+    // Command buffers committed by the last EndFrame (retained). Reading an FB that has not been
+    // drawn this frame waits on these, then reads on the readback queue: see ReadFramebufferToCPU.
+    std::vector<MTL::CommandBuffer*> mLastFrameCmdBufs;
     NS::AutoreleasePool* mFrameAutoreleasePool;
 
     int mCurrentTile;

@@ -9,7 +9,7 @@ struct FrameUniforms {
     float noiseScale;
 };
 
-// Do not gate these fields behind @if. setFragmentBytes() copies sizeof(DrawUniforms) from the
+// Do not gate these fields behind conditional Prism blocks. setFragmentBytes() copies sizeof(DrawUniforms) from the
 // one fixed C++ layout in gfx_metal.h for every variant, so a shorter struct here reads the
 // wrong field at the wrong offset.
 struct DrawUniforms {
