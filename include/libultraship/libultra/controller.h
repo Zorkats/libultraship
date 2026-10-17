@@ -67,6 +67,10 @@
 #define BTN_CUP 0x00008
 #define BTN_R 0x00010
 #define BTN_L 0x00020
+// G-Diffuser: gamepad X and Y ride the two button bits the N64 never used. Only the port's input
+// action layer reads them (port/gdx_input_actions.h); the game never sees these bits.
+#define BTN_X 0x00040
+#define BTN_Y 0x00080
 #define BTN_DRIGHT 0x00100
 #define BTN_DLEFT 0x00200
 #define BTN_DDOWN 0x00400

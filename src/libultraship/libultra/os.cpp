@@ -122,6 +122,9 @@ int32_t osEPiStartDma(OSPiHandle* pihandle, OSIoMesg* mb, int32_t direction) {
 // port/gdx_audio_thread.cpp; declared without a header for the same reason as
 // GdxSegmentSourceRead above.
 extern "C" int gdx_audio_thread_active(void);
+// port/gdx_music_stream.cpp (plan 6A streamed BGM). Declared here for the same reason.
+extern "C" int gdx_music_stream_is_mixing(void);
+extern "C" int gdx_music_stream_mix_s16(int16_t* stereo, size_t frames, uint32_t deviceRate);
 
 uint32_t osAiGetLength() {
     // Hardware returns the bytes still queued in the AI FIFO; the host backend's buffered frame
@@ -224,6 +227,19 @@ int32_t osAiSetNextBuffer(void* buff, size_t len) {
 
     if (player == nullptr || !player->IsInitialized()) {
         return 0;
+    }
+    // Streamed BGM replacement (plan 6A). Mixed before the low-pass and master volume so the stream
+    // takes the same output stage as the stock mix. Works on a copy, and only while a stream is live.
+    {
+        static std::vector<int16_t> sStreamBuf;
+        if ((playLen % 4) == 0 && gdx_music_stream_is_mixing()) {
+            const size_t frames = playLen / 4;
+            const int16_t* src = reinterpret_cast<const int16_t*>(playBuf);
+            sStreamBuf.assign(src, src + frames * 2);
+            if (gdx_music_stream_mix_s16(sStreamBuf.data(), frames, static_cast<uint32_t>(player->GetSampleRate()))) {
+                playBuf = reinterpret_cast<const uint8_t*>(sStreamBuf.data());
+            }
+        }
     }
     // Output reconstruction low-pass, modelling the N64 DAC output stage that a raw HLE
     // pipeline omits (measured +7.4dB of excess HF imaging near Nyquist without it). 4th-order

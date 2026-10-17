@@ -950,8 +950,89 @@ static bool ScaledTextureExtent(const RDP* rdp, int tile, uint32_t maxTextureSiz
     }
     ApplyTileMaskExtent(rdp, tile, width, height, true);
     const uint32_t limit = std::min(8192u, maxTextureSize);
-    return width > 0 && height > 0 && width <= loaded.resource_width && height <= loaded.resource_height &&
-           uint64_t(width) * sx <= limit && uint64_t(height) * sy <= limit;
+    const bool fits = width > 0 && height > 0 && width <= loaded.resource_width && height <= loaded.resource_height &&
+                      uint64_t(width) * sx <= limit && uint64_t(height) * sy <= limit;
+    if (!fits) {
+        // Every caller skips the upload or the draw on failure, so the geometry silently vanishes.
+        // Name each replacement once so the next layout mismatch is visible in the log.
+        static std::set<const Fast::Texture*> sLogged;
+        if (sLogged.size() < 64 && sLogged.insert(loaded.raw_tex_metadata.resource.get()).second) {
+            const auto initData = loaded.raw_tex_metadata.resource->GetInitData();
+            SPDLOG_WARN("[hd-extent] {} loaded as {}x{} cannot cover a {}x{} tile: draw skipped",
+                        initData != nullptr ? initData->Path : std::string("?"), loaded.resource_width,
+                        loaded.resource_height, width, height);
+        }
+    }
+    return fits;
+}
+
+// LOADBLOCK copies texels linearly, so only the load width decides their 2D layout. Asset metadata
+// can describe the same texel run at another width: course_track_gfx D_8002008 and D_8003008 are
+// declared 128x16, but the borderless road samples them 64 wide and 32 tall. An HD replacement
+// built at the declared shape then fails ScaledTextureExtent and the road is not drawn. This re-lays
+// the HD pixels out at the load width so every native texel keeps its own HD block. Only whole-image
+// loads with exactly the declared texel count qualify. Results are cached per source and width; the
+// entry holds the source alive so its address stays a valid key. The cache is never destroyed on
+// purpose: IResource's destructor logs through spdlog, which is already gone during static teardown.
+static std::shared_ptr<Fast::Texture> RelayoutScaledBlock(const RawTexMetadata& metadata, const uint8_t* addr,
+                                                          uint32_t uls, uint32_t ult, uint32_t width,
+                                                          uint32_t height) {
+    uint32_t sx, sy;
+    if (uls != 0 || ult != 0 || width == 0 || height == 0 || !ScaledTextureDimensions(metadata, sx, sy)) {
+        return nullptr;
+    }
+    const auto& tex = metadata.resource;
+    const uint32_t nativeWidth = tex->Width / sx;
+    const uint32_t nativeHeight = tex->Height / sy;
+    const uint32_t pixelBits = ScaledTextureBitsPerPixel(metadata);
+    if (addr != tex->ImageData || width == nativeWidth || pixelBits % 8 != 0 ||
+        uint64_t(width) * height != uint64_t(nativeWidth) * nativeHeight || uint64_t(width) * sx > 8192 ||
+        uint64_t(height) * sy > 8192) {
+        return nullptr;
+    }
+
+    struct Entry {
+        std::shared_ptr<Fast::Texture> source;
+        std::shared_ptr<Fast::Texture> relaid;
+    };
+    static auto& sRelaid = *new std::map<std::pair<const Fast::Texture*, uint32_t>, Entry>();
+    const std::pair<const Fast::Texture*, uint32_t> key{ tex.get(), width };
+    const auto cached = sRelaid.find(key);
+    if (cached != sRelaid.end()) {
+        return cached->second.relaid;
+    }
+
+    const uint32_t bytesPerPixel = pixelBits / 8;
+    const uint32_t blockBytes = sx * bytesPerPixel;
+    const uint32_t sourceStride = tex->Width * bytesPerPixel;
+    const uint32_t relaidStride = width * blockBytes;
+    const uint32_t dataSize = relaidStride * height * sy;
+    auto relaid = std::make_shared<Fast::Texture>(tex->GetInitData());
+    relaid->Type = tex->Type;
+    relaid->Width = static_cast<uint16_t>(width * sx);
+    relaid->Height = static_cast<uint16_t>(height * sy);
+    relaid->Flags = tex->Flags;
+    relaid->HByteScale = tex->HByteScale;
+    relaid->VPixelScale = tex->VPixelScale;
+    relaid->ImageDataSize = dataSize;
+    relaid->ImageData = new uint8_t[dataSize];
+    for (uint32_t texel = 0; texel < width * height; texel++) {
+        const uint32_t loadX = texel % width;
+        const uint32_t loadY = texel / width;
+        const uint32_t declaredX = texel % nativeWidth;
+        const uint32_t declaredY = texel / nativeWidth;
+        for (uint32_t row = 0; row < sy; row++) {
+            memcpy(relaid->ImageData + (loadY * sy + row) * relaidStride + loadX * blockBytes,
+                   tex->ImageData + (declaredY * sy + row) * sourceStride + declaredX * blockBytes, blockBytes);
+        }
+    }
+
+    const auto initData = tex->GetInitData();
+    SPDLOG_WARN("[hd-relayout] {} is declared {}x{} but loaded {} wide: re-laid out as {}x{}",
+                initData != nullptr ? initData->Path : std::string("?"), nativeWidth, nativeHeight, width, width,
+                height);
+    sRelaid.emplace(key, Entry{ tex, relaid });
+    return relaid;
 }
 
 void Interpreter::ImportTextureRgba16(int textureUnit, int tile, bool importReplacement, bool forceOpaqueAlpha) {
@@ -4591,6 +4672,21 @@ void Interpreter::GfxDpLoadBlock(uint8_t tile, uint32_t uls, uint32_t ult, uint3
         const uint64_t rowBits = uint64_t(width) * pixelBits;
         const uint32_t height = rowBits != 0 && bits % rowBits == 0
             ? static_cast<uint32_t>(bits / rowBits) : 0;
+        if (const auto relaid = RelayoutScaledBlock(source.raw_tex_metadata, source.addr, uls, ult, width, height)) {
+            // Swap the relaid image in for this one load only; later loads from the same SETTIMG
+            // must still see the pack resource.
+            auto& pending = mRdp->texture_to_load;
+            const RawTexMetadata savedMetadata = pending.raw_tex_metadata;
+            const auto savedAddr = pending.addr;
+            pending.raw_tex_metadata.resource = relaid;
+            pending.raw_tex_metadata.width = relaid->Width;
+            pending.raw_tex_metadata.height = relaid->Height;
+            pending.addr = relaid->ImageData;
+            LoadScaledTexture(tile, 0, 0, width, height, true);
+            pending.raw_tex_metadata = savedMetadata;
+            pending.addr = savedAddr;
+            return;
+        }
         LoadScaledTexture(tile, uls * transferBits / pixelBits, ult, width, height, true);
         return;
     }

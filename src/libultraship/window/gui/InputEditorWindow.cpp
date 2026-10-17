@@ -22,7 +22,8 @@ void InputEditorWindow::InitElement() {
     mRumbleMappingToTest = nullptr;
     mInputEditorPopupOpen = false;
 
-    mButtonsBitmasks = { BTN_A, BTN_B, BTN_START, BTN_L, BTN_R, BTN_Z, BTN_CUP, BTN_CDOWN, BTN_CLEFT, BTN_CRIGHT };
+    mButtonsBitmasks = { BTN_A,   BTN_B,     BTN_START, BTN_L,      BTN_R, BTN_Z,
+                         BTN_CUP, BTN_CDOWN, BTN_CLEFT, BTN_CRIGHT, BTN_X, BTN_Y };
     mDpadBitmasks = { BTN_DUP, BTN_DDOWN, BTN_DLEFT, BTN_DRIGHT };
 }
 
@@ -473,6 +474,7 @@ void InputEditorWindow::DrawStickDirectionLineAddMappingButton(uint8_t port, uin
                     ->GetControllerByPort(port)
                     ->GetRightStick()
                     ->AddOrEditAxisDirectionMappingFromRawPress(direction, "")) {
+                mInputEditorPopupOpen = false;
                 ImGui::CloseCurrentPopup();
             }
         }
@@ -562,6 +564,7 @@ void InputEditorWindow::DrawStickDirectionLineEditMappingButton(uint8_t port, ui
                     ->GetControllerByPort(port)
                     ->GetRightStick()
                     ->AddOrEditAxisDirectionMappingFromRawPress(direction, id)) {
+                mInputEditorPopupOpen = false;
                 ImGui::CloseCurrentPopup();
             }
         }
@@ -1277,6 +1280,9 @@ void InputEditorWindow::DrawPortTab(uint8_t portIndex) {
                            CHIP_COLOR_N64_YELLOW);
             DrawButtonLine(StringHelper::Sprintf("C %s", ICON_FA_ARROW_RIGHT).c_str(), portIndex, BTN_CRIGHT,
                            CHIP_COLOR_N64_YELLOW);
+            // G-Diffuser spare bits: not N64 buttons, used only by the Controls > Actions page.
+            DrawButtonLine("X", portIndex, BTN_X);
+            DrawButtonLine("Y", portIndex, BTN_Y);
         }
 
         if (ImGui::CollapsingHeader("D-Pad", NULL, ImGuiTreeNodeFlags_DefaultOpen)) {

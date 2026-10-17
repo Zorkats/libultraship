@@ -79,6 +79,9 @@ void ControllerDefaultMappings::SetDefaultSDLButtonToButtonMappings(
         // which frees both triggers for Z (see the axis map below).
         { BTN_R, { SDL_CONTROLLER_BUTTON_RIGHTSHOULDER } },
         { BTN_START, { SDL_CONTROLLER_BUTTON_START } },
+        // X and Y on the spare bits, so the action layer and the controller profiles can use them.
+        { BTN_X, { SDL_CONTROLLER_BUTTON_X } },
+        { BTN_Y, { SDL_CONTROLLER_BUTTON_Y } },
         { BTN_DUP, { SDL_CONTROLLER_BUTTON_DPAD_UP } },
         { BTN_DDOWN, { SDL_CONTROLLER_BUTTON_DPAD_DOWN } },
         { BTN_DLEFT, { SDL_CONTROLLER_BUTTON_DPAD_LEFT } },
