@@ -1818,10 +1818,44 @@ bool GdxCompilePipelinePassOGL(const std::filesystem::path& path, GfxRenderingAP
     return true;
 }
 
+#ifdef USE_OPENGLES
+// GLES did not get clamp-to-border into core until 3.2, and the header this file includes is
+// GLES3/gl3.h (3.0), so the name is not declared at all. The value is the same one desktop GL
+// and every vendor extension use, and it is only ever handed to glTexParameteri.
+//
+// Whether the driver ACCEPTS it is a separate question, answered once at first use rather than
+// assumed: a 3.0/3.1 device without EXT/OES_texture_border_clamp rejects it with
+// GL_INVALID_ENUM and silently leaves the texture on its default GL_REPEAT, which tiles a
+// post-processing pass instead of bordering it — a much louder artifact than the clamp-to-edge
+// this falls back to.
+#define GDX_GLES_CLAMP_TO_BORDER 0x812D
+
+static GLenum GdxGlesBorderClampWrap() {
+    static const GLenum wrap = [] {
+        const char* extensions = reinterpret_cast<const char*>(glGetString(GL_EXTENSIONS));
+        const bool supported =
+            extensions != nullptr && (std::strstr(extensions, "GL_EXT_texture_border_clamp") != nullptr ||
+                                      std::strstr(extensions, "GL_OES_texture_border_clamp") != nullptr ||
+                                      std::strstr(extensions, "GL_NV_texture_border_clamp") != nullptr);
+        if (!supported) {
+            SPDLOG_INFO("GLES: no texture_border_clamp extension; post-pipeline passes asking for "
+                        "clamp-to-border will use clamp-to-edge instead.");
+            return static_cast<GLenum>(GL_CLAMP_TO_EDGE);
+        }
+        return static_cast<GLenum>(GDX_GLES_CLAMP_TO_BORDER);
+    }();
+    return wrap;
+}
+#endif
+
 static GLenum GdxPipelineWrapModeOGL(GdxPostPassDesc::WrapMode mode) {
     switch (mode) {
         case GdxPostPassDesc::WrapMode::ClampToBorder:
+#ifdef USE_OPENGLES
+            return GdxGlesBorderClampWrap();
+#else
             return GL_CLAMP_TO_BORDER;
+#endif
         case GdxPostPassDesc::WrapMode::Repeat:
             return GL_REPEAT;
         case GdxPostPassDesc::WrapMode::MirroredRepeat:
