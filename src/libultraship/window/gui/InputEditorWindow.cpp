@@ -1210,27 +1210,64 @@ void InputEditorWindow::DrawDeviceToggles(uint8_t portIndex) {
     for (const auto& [instanceId, name] : connectedDeviceManager->GetConnectedSDLGamepadNames()) {
         // Scope IDs per device so identical names (e.g. multiple GameCube adapter ports) don't collide.
         ImGui::PushID(instanceId);
+
+        // Determine which port currently owns this gamepad (-1 = unassigned).
+        // A port "owns" the gamepad when it is NOT ignoring its instanceId.
+        int ownerPort = -1;
+        for (int p = 0; p < 4; p++) {
+            if (!connectedDeviceManager->PortIsIgnoringInstanceId(static_cast<uint8_t>(p), instanceId)) {
+                ownerPort = p;
+                break;
+            }
+        }
+
+        // Radio button: selected when this port is the exclusive owner.
+        bool selected = (ownerPort == static_cast<int>(portIndex));
+        if (ImGui::RadioButton(StringHelper::Sprintf("###radioInstanceId_%d", instanceId).c_str(), selected)) {
+            // Assign exclusively to this port:
+            // 1. Unignore for the current port.
+            connectedDeviceManager->UnignoreInstanceIdForPort(portIndex, instanceId);
+            // 2. Ignore for all other ports (auto-swap / exclusive one-gamepad-per-port).
+            for (uint8_t p = 0; p < 4; p++) {
+                if (p != portIndex) {
+                    connectedDeviceManager->IgnoreInstanceIdForPort(p, instanceId);
+                }
+            }
+        }
+
+        ImGui::SameLine();
+
+        // Gamepad button label (display-only).
         ImGui::PushItemFlag(ImGuiItemFlags_Disabled, true);
         auto buttonColor = ImGui::GetStyleColorVec4(ImGuiCol_Button);
         auto buttonHoveredColor = ImGui::GetStyleColorVec4(ImGuiCol_ButtonHovered);
         GetButtonColorsForPhysicalDeviceType(Ship::PhysicalDeviceType::SDLGamepad, buttonColor, buttonHoveredColor);
         ImGui::PushStyleColor(ImGuiCol_Button, buttonColor);
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, buttonHoveredColor);
-        auto notIgnored = !connectedDeviceManager->PortIsIgnoringInstanceId(portIndex, instanceId);
+        ImGui::Button(StringHelper::Sprintf("%s %s", ICON_FA_GAMEPAD, name.c_str()).c_str());
+        ImGui::PopStyleColor();
+        ImGui::PopStyleColor();
         ImGui::PopItemFlag();
-        if (ImGui::Checkbox(StringHelper::Sprintf("###instanceId_%d", instanceId).c_str(), &notIgnored)) {
-            if (notIgnored) {
-                connectedDeviceManager->UnignoreInstanceIdForPort(portIndex, instanceId);
-            } else {
-                connectedDeviceManager->IgnoreInstanceIdForPort(portIndex, instanceId);
-            }
-        };
-        ImGui::PushItemFlag(ImGuiItemFlags_Disabled, true);
+
+        // Show which port this gamepad is currently connected to.
         ImGui::SameLine();
-        ImGui::Button(StringHelper::Sprintf("%s %s (SDL)", ICON_FA_GAMEPAD, name.c_str()).c_str());
-        ImGui::PopStyleColor();
-        ImGui::PopStyleColor();
-        ImGui::PopItemFlag();
+        ImGui::AlignTextToFramePadding();
+        if (ownerPort >= 0) {
+            if (ownerPort == static_cast<int>(portIndex)) {
+                // This port owns it - show in green.
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.2f, 0.85f, 0.4f, 1.0f));
+            } else {
+                // Another port owns it - show greyed out.
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.6f, 0.6f, 0.6f, 1.0f));
+            }
+            ImGui::Text("-> Port %d", ownerPort + 1);
+            ImGui::PopStyleColor();
+        } else {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.5f, 0.5f, 0.5f, 0.7f));
+            ImGui::Text("(unassigned)");
+            ImGui::PopStyleColor();
+        }
+
         ImGui::PopID();
     }
 }
