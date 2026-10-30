@@ -7723,6 +7723,8 @@ void Interpreter::StartFrame() {
     }
     const bool widescreenPillarbox = !mWidescreenEnabledCache || mForceFixedAspectCache;
     sGameFbMsaaResolvedSized = false;
+    const uintptr_t prevGameFbTex = (uintptr_t)mRapi->GetFramebufferTextureId(mGameFb);
+    const uintptr_t prevResolvedFbTex = (uintptr_t)mRapi->GetFramebufferTextureId(mGameFbMsaaResolved);
     if (!ViewportMatchesRendererResolution() || mMsaaLevel > 1 || widescreenPillarbox || mPostShaderCache != 0) {
         mRendersToFb = true;
         if (!ViewportMatchesRendererResolution() || (widescreenPillarbox && mMsaaLevel <= 1)) {
@@ -7749,6 +7751,16 @@ void Interpreter::StartFrame() {
         }
     } else {
         mRendersToFb = false;
+    }
+
+    // A resize can replace these textures, and D3D11 releases the old view when it does. Only Run()
+    // republishes mGfxFrameBuffer, so a taskless hold frame would composite the released view. Drop
+    // it, and the port's taskless present republishes through its frame mirror path instead.
+    if (mGfxFrameBuffer != 0 &&
+        ((mGfxFrameBuffer == prevGameFbTex && prevGameFbTex != (uintptr_t)mRapi->GetFramebufferTextureId(mGameFb)) ||
+         (mGfxFrameBuffer == prevResolvedFbTex &&
+          prevResolvedFbTex != (uintptr_t)mRapi->GetFramebufferTextureId(mGameFbMsaaResolved)))) {
+        mGfxFrameBuffer = 0;
     }
 
     mFbActive = false;
