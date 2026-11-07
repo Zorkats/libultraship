@@ -562,6 +562,12 @@ extern "C" int gdx_workshop_texture_packs_enabled(void);
 extern "C" const char* GdxWorkshopLookupAtlasTileOverride(const char* baseKey, size_t byteOffset, int n64Fmt,
                                                           int n64Siz, int width, int height);
 extern "C" const char* GDiffuser_LookupLoadedAssetKeyContaining(const void* addr, size_t* outByteOffset);
+// Palette-aware HD textures (port/gdx_workshop.cpp, port/gdx_palette_crc.h) and the exact-base
+// registry lookup (port/AssetLoader.cpp) for whole images copied into RDRAM.
+extern "C" int GdxWorkshopPaletteVariantsPresent(void);
+extern "C" const char* GdxWorkshopLookupPaletteVariant(const char* baseKey, const uint8_t* palette,
+                                                       size_t paletteSize);
+extern "C" const char* GDiffuser_LookupLoadedAssetKeyAndSize(const void* buffer, size_t* outSize);
 
 void Interpreter::GdxDumpDecodedRgba32(int tile, const uint8_t* rgba32, uint32_t width, uint32_t height) {
     if (!gdx_workshop_texture_dump_enabled()) {
@@ -2038,7 +2044,139 @@ void Interpreter::ImportTextureRaw(int tile, bool importReplacement) {
     mRapi->UploadTexture(mTexUploadBuffer, resultNewLineSize / 4, resultNewHeight);
 }
 
+// Palette-aware HD textures, as GLideN64 keys them: a pack built from a GLideN64 cache ships one
+// RGBA32 image per palette for a CI texture drawn with several palettes, at
+// textures/pack/<key>.pal/<CC>-<CRC> (port/gdx_palette_crc.h). Finds the image for the palette this
+// tile is drawn with and fills `variant` with a view of it, or returns false to decode stock.
+// Only whole-image loads from the first texel qualify: the image replaces the full texture.
+static bool GdxPaletteVariantFor(RDP* rdp, int tile, LoadedTexture& variant) {
+    const auto& tt = rdp->texture_tile[tile];
+    if (tt.fmt != G_IM_FMT_CI || (tt.siz != G_IM_SIZ_4b && tt.siz != G_IM_SIZ_8b)) {
+        return false;
+    }
+    if (!gdx_workshop_texture_packs_enabled() || !GdxWorkshopPaletteVariantsPresent()) {
+        return false;
+    }
+    const LoadedTexture& loaded = rdp->loaded_texture[tt.tmem_index];
+    if (loaded.addr == nullptr || loaded.masked || loaded.resource_bit_offset != 0 || loaded.orig_size_bytes == 0) {
+        return false;
+    }
+    // The palette as the CI decoders read it. palettes[] can also hold a raw DRAM pointer (a TLUT
+    // below TMEM word 256), whose length is unknown, so only the staging buffers are hashed.
+    uint8_t ci8[512];
+    const uint8_t* palette;
+    size_t paletteSize;
+    if (tt.siz == G_IM_SIZ_4b) {
+        const uint32_t slot = (tt.palette / 8) & 1;
+        if (rdp->palettes[slot] != rdp->palette_staging[slot]) {
+            return false;
+        }
+        palette = rdp->palette_staging[slot] + (tt.palette % 8) * 32;
+        paletteSize = 32;
+    } else {
+        if (rdp->palettes[0] != rdp->palette_staging[0] || rdp->palettes[1] != rdp->palette_staging[1]) {
+            return false;
+        }
+        memcpy(ci8, rdp->palette_staging[0], 256);
+        memcpy(ci8 + 256, rdp->palette_staging[1], 256);
+        palette = ci8;
+        paletteSize = sizeof(ci8);
+    }
+    // The base key: the resource path for textures drawn by path, else the registry key of the
+    // RDRAM buffer this load starts at. A plain override (textures/pack/<key>, redirected at
+    // SETTIMG) keys on <key>, so a pack's variant for the active palette still wins over it.
+    std::string resourceKey;
+    const char* baseKey = nullptr;
+    bool fromPack = false;
+    if (loaded.raw_tex_metadata.resource != nullptr) {
+        const auto initData = loaded.raw_tex_metadata.resource->GetInitData();
+        if (initData == nullptr) {
+            return false;
+        }
+        std::string_view path = initData->Path;
+        if (path.starts_with(Ship::IResource::gAltAssetPrefix)) {
+            path.remove_prefix(Ship::IResource::gAltAssetPrefix.length());
+        }
+        constexpr std::string_view kOtrPrefix = "__OTR__";
+        if (path.starts_with(kOtrPrefix)) {
+            path.remove_prefix(kOtrPrefix.length());
+        }
+        constexpr std::string_view kPackPrefix = "textures/pack/";
+        if (path.starts_with(kPackPrefix)) {
+            path.remove_prefix(kPackPrefix.length());
+            fromPack = true;
+            // Atlas bands and variants themselves are never a base key.
+            if (path.starts_with("atlas/") || path.find(".pal/") != std::string_view::npos) {
+                return false;
+            }
+        }
+        if (path.empty()) {
+            return false;
+        }
+        resourceKey.assign(path);
+        baseKey = resourceKey.c_str();
+    } else {
+        size_t bufferSize = 0;
+        baseKey = GDiffuser_LookupLoadedAssetKeyAndSize(loaded.addr, &bufferSize);
+    }
+    if (baseKey == nullptr) {
+        return false;
+    }
+    const char* variantPath = GdxWorkshopLookupPaletteVariant(baseKey, palette, paletteSize);
+    if (variantPath == nullptr) {
+        return false;
+    }
+    std::shared_ptr<Fast::Texture> tex = std::static_pointer_cast<Fast::Texture>(
+        Ship::Context::GetInstance()->GetResourceManager()->LoadResourceProcess(variantPath));
+    if (tex == nullptr || tex->ImageData == nullptr || tex->Type != Fast::TextureType::RGBA32bpp ||
+        (tex->Flags & TEX_FLAG_LOAD_AS_RAW) == 0) {
+        return false;
+    }
+    const double scaledBytes = double(loaded.orig_size_bytes) * tex->HByteScale * tex->VPixelScale;
+    if (scaledBytes != double(tex->ImageDataSize)) {
+        return false;
+    }
+    // A plain override's load already carries its scale in the line sizes. Only a variant at the
+    // same scale can take its place (the converter writes both from one image).
+    if (fromPack && (loaded.raw_tex_metadata.h_byte_scale != tex->HByteScale ||
+                     loaded.raw_tex_metadata.v_pixel_scale != tex->VPixelScale)) {
+        return false;
+    }
+    variant = loaded;
+    variant.raw_tex_metadata = { tex->Width, tex->Height, tex->HByteScale, tex->VPixelScale, tex, tex->Type };
+    variant.tex_flags = tex->Flags;
+    variant.addr = reinterpret_cast<const uint8_t*>(tex->ImageData);
+    variant.size_bytes = tex->ImageDataSize;
+    if (!fromPack) {
+        variant.line_size_bytes = static_cast<uint32_t>(loaded.line_size_bytes * tex->HByteScale);
+        variant.full_image_line_size_bytes = variant.line_size_bytes;
+    }
+    variant.resource_bit_offset = 0;
+    return true;
+}
+
 void Interpreter::ImportTexture(int i, int tile, bool importReplacement) {
+    // A palette variant stands in for this tile's load only while it is imported: the next draw
+    // from the same TMEM may use another palette. The cache key follows, as it hashes the address.
+    struct LoadedTextureRestore {
+        LoadedTexture* slot = nullptr;
+        LoadedTexture saved{};
+        ~LoadedTextureRestore() {
+            if (slot != nullptr) {
+                *slot = std::move(saved);
+            }
+        }
+    } restoreLoaded;
+    if (!importReplacement) {
+        LoadedTexture variant{};
+        if (GdxPaletteVariantFor(mRdp, tile, variant)) {
+            LoadedTexture& slot = mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index];
+            restoreLoaded.saved = slot;
+            restoreLoaded.slot = &slot;
+            slot = std::move(variant);
+        }
+    }
+
     uint8_t fmt = mRdp->texture_tile[tile].fmt;
     uint8_t siz = mRdp->texture_tile[tile].siz;
     uint32_t texFlags = mRdp->loaded_texture[mRdp->texture_tile[tile].tmem_index].tex_flags;
@@ -4775,22 +4913,27 @@ void Interpreter::GfxDpLoadBlock(uint8_t tile, uint32_t uls, uint32_t ult, uint3
     // available yet. Width 1 is the standard block-load sentinel and means the
     // entire transfer is one contiguous line until SETTILE supplies the layout.
     uint32_t source_line_bytes = logical_line_bytes != 0 ? logical_line_bytes : size_bytes;
+    bool nativeStride = logical_line_bytes != 0;
     if (mRdp->texture_to_load.width > 1) {
         const uint32_t transferLineBytes =
             byteCountForTexels(mRdp->texture_to_load.width, mRdp->texture_to_load.siz);
         if (logical_line_bytes == 0 && transferLineBytes > 0 &&
             transferLineBytes <= size_bytes && size_bytes % transferLineBytes == 0) {
             source_line_bytes = transferLineBytes;
+            nativeStride = true;
         }
     }
 
     // HD pack whole-image replacements (e.g. 4x portraits) carry their real pixel
     // dimensions in raw_tex_metadata. The stock SETTIMG width describes the logical
     // (native) row, so the source stride must be multiplied by the horizontal upscale
-    // to step through the replacement's rows correctly.
+    // to step through the replacement's rows correctly. A block load with no row layout
+    // yet (width 1, before SETTILE) keeps the whole transfer as one line: size_bytes is
+    // already scaled, and scaling it again leaves the line longer than the load, so the
+    // draw sees zero rows and wraps the image once per native row (raw CI4 sprites).
     const float h_byte_scale = mRdp->texture_to_load.raw_tex_metadata.h_byte_scale;
     const float v_pixel_scale = mRdp->texture_to_load.raw_tex_metadata.v_pixel_scale;
-    if (h_byte_scale != 1.0f || v_pixel_scale != 1.0f) {
+    if ((h_byte_scale != 1.0f || v_pixel_scale != 1.0f) && nativeStride) {
         source_line_bytes = static_cast<uint32_t>(source_line_bytes * h_byte_scale);
     }
 
