@@ -41,6 +41,9 @@ class SDLAxisDirectionToAnyMapping : virtual public ControllerInputMapping {
      */
     bool AxisIsStick();
 
+    SDL_GameControllerAxis GetSDLControllerAxis() const { return mControllerAxis; }
+    AxisDirection GetAxisDirection() const { return mAxisDirection; }
+
   protected:
     SDL_GameControllerAxis mControllerAxis;
     AxisDirection mAxisDirection;

@@ -33,6 +33,11 @@ class Fast3dWindow : public Ship::Window {
     Fast3dWindow(std::shared_ptr<Ship::Gui> gui, std::shared_ptr<FastMouseStateManager> mouseStateManager);
     ~Fast3dWindow();
 
+    // Observes every keyboard event. Consumed presses remain available for capture, not gameplay.
+    // Releases/all-keys-up are unconditional and report consumed=false.
+    using KeyboardEventCallback = void (*)(Ship::KbEventType, Ship::KbScancode, bool consumed);
+    void SetKeyboardEventCallback(KeyboardEventCallback callback) { mKeyboardEventCallback = callback; }
+
     void Init() override;
     void Close() override;
     void RunGuiOnly() override;
@@ -98,6 +103,7 @@ class Fast3dWindow : public Ship::Window {
     static void OnFullscreenChanged(bool isNowFullscreen);
 
   private:
+    KeyboardEventCallback mKeyboardEventCallback = nullptr;
     GfxRenderingAPI* mRenderingApi;
     GfxWindowBackend* mWindowManagerApi;
     std::shared_ptr<Interpreter> mInterpreter = nullptr;

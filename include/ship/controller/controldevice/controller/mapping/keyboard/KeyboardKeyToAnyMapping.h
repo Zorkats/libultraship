@@ -37,6 +37,8 @@ class KeyboardKeyToAnyMapping : virtual public ControllerInputMapping {
     /** @brief Returns the human-readable name of the bound key. */
     std::string GetPhysicalInputName() override;
 
+    KbScancode GetKeyboardScancode() const { return mKeyboardScancode; }
+
   protected:
     KbScancode mKeyboardScancode;
     bool mKeyPressed;

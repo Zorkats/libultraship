@@ -55,6 +55,10 @@ class InputEditorWindow : public Ship::GuiWindow {
      */
     bool TestingRumble();
 
+    // Reuse device and analog configuration in game-specific, action-based editors.
+    void DrawMovementSettings(uint8_t port);
+    void DrawDeviceSettings(uint8_t port);
+
   protected:
     /** @brief Registers button bitmasks and performs initial population of mapping tables. */
     void InitElement() override;

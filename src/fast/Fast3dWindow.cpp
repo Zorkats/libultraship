@@ -405,6 +405,10 @@ bool Fast3dWindow::KeyUp(int32_t scancode) {
     if (ctx == nullptr) {
         return false;
     }
+    auto window = std::static_pointer_cast<Fast3dWindow>(ctx->GetWindow());
+    if (window->mKeyboardEventCallback != nullptr) {
+        window->mKeyboardEventCallback(Ship::LUS_KB_EVENT_KEY_UP, static_cast<Ship::KbScancode>(scancode), false);
+    }
     if (scancode == ctx->GetWindow()->GetFullscreenScancode()) {
         ctx->GetWindow()->ToggleFullscreen();
     }
@@ -428,8 +432,12 @@ bool Fast3dWindow::KeyDown(int32_t scancode) {
     if (ctx == nullptr) {
         return false;
     }
+    auto window = std::static_pointer_cast<Fast3dWindow>(ctx->GetWindow());
     if (scancode == ctx->GetWindow()->GetFullscreenScancode() ||
         scancode == ctx->GetWindow()->GetMouseCaptureScancode()) {
+        if (window->mKeyboardEventCallback != nullptr) {
+            window->mKeyboardEventCallback(Ship::LUS_KB_EVENT_KEY_DOWN, static_cast<Ship::KbScancode>(scancode), false);
+        }
         ctx->GetWindow()->SetLastScancode(scancode);
         return ctx->GetControlDeck()->ProcessKeyboardEvent(Ship::KbEventType::LUS_KB_EVENT_KEY_DOWN,
                                                            static_cast<Ship::KbScancode>(scancode));
@@ -437,6 +445,9 @@ bool Fast3dWindow::KeyDown(int32_t scancode) {
 
     // G-Diffuser Course Edit tool keys and menu rebind capture; see KeyUp above.
     int consumed = gdx_course_edit_mouse_on_key(scancode, 1);
+    if (window->mKeyboardEventCallback != nullptr) {
+        window->mKeyboardEventCallback(Ship::LUS_KB_EVENT_KEY_DOWN, static_cast<Ship::KbScancode>(scancode), consumed != 0);
+    }
     if (consumed) {
         ctx->GetWindow()->SetLastScancode(scancode);
         return true;
@@ -453,6 +464,10 @@ void Fast3dWindow::AllKeysUp() {
     auto ctx = Ship::Context::GetInstance();
     if (ctx == nullptr) {
         return;
+    }
+    auto window = std::static_pointer_cast<Fast3dWindow>(ctx->GetWindow());
+    if (window->mKeyboardEventCallback != nullptr) {
+        window->mKeyboardEventCallback(Ship::LUS_KB_EVENT_ALL_KEYS_UP, Ship::LUS_KB_UNKNOWN, false);
     }
     gdx_course_edit_mouse_all_keys_up();
     ctx->GetControlDeck()->ProcessKeyboardEvent(Ship::KbEventType::LUS_KB_EVENT_ALL_KEYS_UP,

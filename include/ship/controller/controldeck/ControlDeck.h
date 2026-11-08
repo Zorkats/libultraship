@@ -80,6 +80,9 @@ class ControlDeck {
      */
     void UnblockGameInput(int32_t blockId);
 
+    /** @brief Reports generic BlockGameInput blockers, independently of device-specific UI blocking. */
+    bool GameInputBlocked() { return AllGameInputBlocked(); }
+
     /** @brief Returns true if any blocker has blocked gamepad game input. */
     bool GamepadGameInputBlocked();
 

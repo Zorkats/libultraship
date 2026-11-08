@@ -29,6 +29,8 @@ class MouseWheelToAnyMapping : virtual public ControllerInputMapping {
     /** @brief Returns the human-readable name of the mouse device. */
     std::string GetPhysicalDeviceName() override;
 
+    WheelDirection GetWheelDirection() const { return mWheelDirection; }
+
   protected:
     WheelDirection mWheelDirection;
 };

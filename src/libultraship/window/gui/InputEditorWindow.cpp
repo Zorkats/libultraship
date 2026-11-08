@@ -1455,6 +1455,24 @@ void InputEditorWindow::DrawSetDefaultsButton(uint8_t portIndex) {
     }
 }
 
+void InputEditorWindow::DrawMovementSettings(uint8_t port) {
+    UpdateStickDirectionToMappingIds(port);
+    DrawStickSection(port, Ship::LEFT, 0);
+}
+
+void InputEditorWindow::DrawDeviceSettings(uint8_t port) {
+    DrawDeviceToggles(port);
+    if (ImGui::CollapsingHeader("Rumble")) {
+        DrawRumbleSection(port);
+    }
+    if (ImGui::CollapsingHeader("Gyro")) {
+        DrawGyroSection(port);
+    }
+    if (ImGui::CollapsingHeader("LEDs")) {
+        DrawLEDSection(port);
+    }
+}
+
 void InputEditorWindow::DrawElement() {
     ImGui::BeginTabBar("##ControllerConfigPortTabs");
     for (uint8_t i = 0; i < 4; i++) {

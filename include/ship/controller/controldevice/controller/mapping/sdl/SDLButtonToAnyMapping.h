@@ -29,6 +29,8 @@ class SDLButtonToAnyMapping : virtual public ControllerInputMapping {
     /** @brief Returns the human-readable name of the SDL gamepad device. */
     std::string GetPhysicalDeviceName() override;
 
+    SDL_GameControllerButton GetSDLControllerButton() const { return mControllerButton; }
+
   protected:
     SDL_GameControllerButton mControllerButton;
 
