@@ -37,6 +37,8 @@ class MouseButtonToAnyMapping : virtual public ControllerInputMapping {
     /** @brief Returns the human-readable name of the bound mouse button. */
     std::string GetPhysicalInputName() override;
 
+    MouseBtn GetMouseButton() const { return mButton; }
+
   protected:
     MouseBtn mButton;
     bool mKeyPressed;

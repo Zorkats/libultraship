@@ -147,6 +147,11 @@ class Gui {
     bool CanUseGamepadNavigation();
     void SetGamepadNavigationBlocked(bool blocked);
 
+    // Explicit binding-capture ownership, independent of ordinary popup navigation blocking.
+    // The owner must clear this on completion, cancellation, hiding, and destruction.
+    void SetInputCaptureActive(bool active);
+    bool IsInputCaptureActive() const;
+
     /** @brief Re-binds the ImGui platform backend's gamepad list to the currently
      *  connected controllers. Called once at init and on controller add/remove so it
      *  is not re-evaluated per frame. The base implementation is a no-op. */
@@ -223,6 +228,7 @@ class Gui {
 
   private:
     bool mGamepadNavigationBlocked = false;
+    bool mInputCaptureActive = false;
     bool mNeedsConsoleVariableSave;
     std::string mImGuiIniPath;
     std::string mImGuiLogPath;
