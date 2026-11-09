@@ -5,7 +5,17 @@
 #include <filesystem>
 #include <unordered_map>
 #include <any>
+#include <cstdio>
 #include <spdlog/spdlog.h>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
 #include "ship/utils/StringHelper.h"
 #include "ship/Context.h"
 
@@ -212,9 +222,49 @@ void Config::Reload() {
 }
 
 void Config::Save() {
-    std::ofstream file(mPath);
-    mNestedJson = mFlattenedJson.unflatten();
-    file << mNestedJson.dump(4);
+    std::string serialized;
+    try {
+        mNestedJson = mFlattenedJson.unflatten();
+        serialized = mNestedJson.dump(4, ' ', false, nlohmann::json::error_handler_t::replace);
+    } catch (const std::exception& e) {
+        SPDLOG_ERROR("Failed to serialize config {}: {}", mPath, e.what());
+        return;
+    }
+
+    const std::string tempPath = mPath + ".tmp";
+    std::ofstream file(tempPath, std::ios::binary | std::ios::trunc);
+    if (!file) {
+        SPDLOG_ERROR("Failed to open temporary config file {} for writing", tempPath);
+        return;
+    }
+    file.write(serialized.data(), static_cast<std::streamsize>(serialized.size()));
+    file.flush();
+    if (!file) {
+        SPDLOG_ERROR("Failed to write temporary config file {}", tempPath);
+        file.close();
+        std::remove(tempPath.c_str());
+        return;
+    }
+    file.close();
+    if (file.fail()) {
+        SPDLOG_ERROR("Failed to close temporary config file {}", tempPath);
+        std::remove(tempPath.c_str());
+        return;
+    }
+
+#ifdef _WIN32
+    if (!MoveFileExA(tempPath.c_str(), mPath.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        SPDLOG_ERROR("Failed to replace config file {} (Windows error {})", mPath, GetLastError());
+        std::remove(tempPath.c_str());
+        return;
+    }
+#else
+    if (std::rename(tempPath.c_str(), mPath.c_str()) != 0) {
+        SPDLOG_ERROR("Failed to replace config file {}", mPath);
+        std::remove(tempPath.c_str());
+        return;
+    }
+#endif
 }
 
 template <typename T> std::vector<T> Config::GetArray(const std::string& key) {
