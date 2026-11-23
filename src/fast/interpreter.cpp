@@ -568,6 +568,12 @@ extern "C" int GdxWorkshopPaletteVariantsPresent(void);
 extern "C" const char* GdxWorkshopLookupPaletteVariant(const char* baseKey, const uint8_t* palette,
                                                        size_t paletteSize);
 extern "C" const char* GDiffuser_LookupLoadedAssetKeyAndSize(const void* buffer, size_t* outSize);
+// Content-keyed HD textures (port/gdx_workshop.cpp): GLideN64 keys, palette CRC << 32 | texel CRC.
+extern "C" int GdxWorkshopCrcOverridesPresent(void);
+extern "C" const char* GdxWorkshopLookupCrcOverride(uint64_t key);
+extern "C" void GdxWorkshopLogCrcKey(uint64_t key, int fmt, int siz, unsigned width, unsigned height, unsigned line,
+                                     unsigned loadedBytes, int fromArchive, const char* result);
+extern "C" int gdx_palette_crc(const uint8_t* palette, size_t size, unsigned entries, uint32_t* outCrc);
 
 void Interpreter::GdxDumpDecodedRgba32(int tile, const uint8_t* rgba32, uint32_t width, uint32_t height) {
     if (!gdx_workshop_texture_dump_enabled()) {
@@ -2101,6 +2107,89 @@ void Interpreter::ImportTextureRaw(int tile, bool importReplacement) {
 // RGBA32 image per palette for a CI texture drawn with several palettes, at
 // textures/pack/<key>.pal/<CC>-<CRC> (port/gdx_palette_crc.h). Finds the image for the palette this
 // tile is drawn with and fills `variant` with a view of it, or returns false to decode stock.
+// GLideN64's 64-bit hi-res key for the texture a tile samples from game memory: the Rice CRC of
+// its texels (rows of width << siz >> 1 bytes, `line` apart, read as big-endian words) in the low
+// 32 bits and, for CI, the CRC of the palette entries 0..cimax in the high 32. Mirrors
+// tools/gen_htc_pack.rice_crc and ci_max. Returns false when the tile cannot be hashed.
+// The port keeps some game-built buffers in host order, so three keys come back, one per byte order
+// of the same texels: as stored (N64 order), 16-bit halves swapped, and 32-bit words reversed.
+constexpr int kGdxContentKeyVariants = 3;
+static bool GdxContentKeyFor(const RDP* rdp, int tile, const uint8_t* addr, uint64_t (&outKeys)[kGdxContentKeyVariants],
+                             uint32_t& outW, uint32_t& outH) {
+    const auto& tt = rdp->texture_tile[tile];
+    const LoadedTexture& loaded = rdp->loaded_texture[tt.tmem_index];
+    if (addr == nullptr || loaded.resource_bit_offset != 0 || tt.siz > G_IM_SIZ_32b) {
+        return false;
+    }
+    const uint32_t width = tt.lrs >= tt.uls ? (tt.lrs - tt.uls + 4u) / 4u : 0u;
+    const uint32_t height = tt.lrt >= tt.ult ? (tt.lrt - tt.ult + 4u) / 4u : 0u;
+    const uint32_t bpl = (width << tt.siz) >> 1;
+    const uint32_t stride = tt.line_size_bytes;
+    if (width == 0 || height == 0 || bpl < 4 || stride == 0 ||
+        uint64_t(height - 1) * stride + bpl > loaded.size_bytes) {
+        return false;
+    }
+    uint32_t crc[kGdxContentKeyVariants] = {};
+    uint32_t cimax = 0;
+    const uint8_t* row = addr;
+    for (int32_t y = static_cast<int32_t>(height) - 1; y >= 0; y--, row += stride) {
+        uint32_t esi[kGdxContentKeyVariants] = {};
+        for (int32_t x = static_cast<int32_t>(bpl) - 4; x >= 0; x -= 4) {
+            const uint8_t* w = row + x;
+            const uint32_t words[kGdxContentKeyVariants] = {
+                (uint32_t(w[0]) << 24) | (uint32_t(w[1]) << 16) | (uint32_t(w[2]) << 8) | w[3],
+                (uint32_t(w[1]) << 24) | (uint32_t(w[0]) << 16) | (uint32_t(w[3]) << 8) | w[2],
+                (uint32_t(w[3]) << 24) | (uint32_t(w[2]) << 16) | (uint32_t(w[1]) << 8) | w[0],
+            };
+            for (int v = 0; v < kGdxContentKeyVariants; v++) {
+                esi[v] = words[v] ^ uint32_t(x);
+                crc[v] = (crc[v] << 4) | (crc[v] >> 28);
+                crc[v] += esi[v];
+            }
+        }
+        for (int v = 0; v < kGdxContentKeyVariants; v++) {
+            crc[v] += esi[v] ^ uint32_t(y);
+        }
+        if (tt.fmt == G_IM_FMT_CI) {
+            for (uint32_t b = 0; b < bpl; b++) {
+                const uint32_t v = tt.siz == G_IM_SIZ_4b ? std::max(row[b] >> 4, row[b] & 0xF) : row[b];
+                cimax = std::max(cimax, v);
+            }
+        }
+    }
+    uint32_t paletteCrc = 0;
+    if (tt.fmt == G_IM_FMT_CI && (tt.siz == G_IM_SIZ_4b || tt.siz == G_IM_SIZ_8b)) {
+        uint8_t ci8[512];
+        const uint8_t* palette;
+        size_t paletteSize;
+        if (tt.siz == G_IM_SIZ_4b) {
+            const uint32_t slot = (tt.palette / 8) & 1;
+            if (rdp->palettes[slot] != rdp->palette_staging[slot]) {
+                return false;
+            }
+            palette = rdp->palette_staging[slot] + (tt.palette % 8) * 32;
+            paletteSize = 32;
+        } else {
+            if (rdp->palettes[0] != rdp->palette_staging[0] || rdp->palettes[1] != rdp->palette_staging[1]) {
+                return false;
+            }
+            memcpy(ci8, rdp->palette_staging[0], 256);
+            memcpy(ci8 + 256, rdp->palette_staging[1], 256);
+            palette = ci8;
+            paletteSize = sizeof(ci8);
+        }
+        if (cimax >= 1 && gdx_palette_crc(palette, paletteSize, cimax + 1u, &paletteCrc) == 0) {
+            return false;
+        }
+    }
+    for (int v = 0; v < kGdxContentKeyVariants; v++) {
+        outKeys[v] = (uint64_t(paletteCrc) << 32) | crc[v];
+    }
+    outW = width;
+    outH = height;
+    return true;
+}
+
 // Only whole-image loads from the first texel qualify: the image replaces the full texture.
 static bool GdxPaletteVariantFor(RDP* rdp, int tile, LoadedTexture& variant) {
     const auto& tt = rdp->texture_tile[tile];
@@ -2447,6 +2536,54 @@ void Interpreter::ImportTexture(int i, int tile, bool importReplacement) {
     }
     if (TextureCacheLookup(i, key)) {
         return;
+    }
+
+    // Content-keyed HD replacement for textures the game builds in memory (the minimap, per-course
+    // track textures): the GLideN64 key of the loaded texels picks a pack image, uploaded in place of
+    // the decode. Runs on cache misses only, and only while a pack carries such images.
+    // Archive-backed stock textures qualify too (their payload is in N64 byte order, as the converter
+    // hashes it); HD pack resources do not.
+    const bool unscaledSource = metadata->resource == nullptr ||
+                                (metadata->h_byte_scale == 1.0f && metadata->v_pixel_scale == 1.0f &&
+                                 (texFlags & (TEX_FLAG_LOAD_AS_RAW | TEX_FLAG_LOAD_AS_IMG)) == 0);
+    if (!importReplacement && unscaledSource && GdxWorkshopCrcOverridesPresent()) {
+        uint64_t contentKeys[kGdxContentKeyVariants] = {};
+        uint32_t keyW = 0, keyH = 0;
+        static const bool sDiagCrc = std::getenv("GDX_DIAG_CRCPACK") != nullptr;
+        const auto& keyTile = mRdp->texture_tile[tile];
+        if (!GdxContentKeyFor(mRdp, tile, origAddr, contentKeys, keyW, keyH)) {
+            if (sDiagCrc) {
+                GdxWorkshopLogCrcKey(0, fmt, siz, (keyTile.lrs - keyTile.uls + 4u) / 4u,
+                                     (keyTile.lrt - keyTile.ult + 4u) / 4u, keyTile.line_size_bytes,
+                                     mRdp->loaded_texture[tmemIdex].size_bytes, metadata->resource != nullptr,
+                                     "(not hashable)");
+            }
+        } else {
+            const char* crcPath = nullptr;
+            int variant = 0;
+            for (; variant < kGdxContentKeyVariants && crcPath == nullptr; variant++) {
+                crcPath = GdxWorkshopLookupCrcOverride(contentKeys[variant]);
+            }
+            if (sDiagCrc) {
+                static const char* const kOrder[] = { "as-stored", "swap16", "swap32" };
+                char result[160];
+                std::snprintf(result, sizeof(result), "%s [%s]", crcPath != nullptr ? crcPath : "(none)",
+                              crcPath != nullptr ? kOrder[variant - 1] : "all orders");
+                GdxWorkshopLogCrcKey(contentKeys[0], fmt, siz, keyW, keyH, keyTile.line_size_bytes,
+                                     mRdp->loaded_texture[tmemIdex].size_bytes, metadata->resource != nullptr,
+                                     result);
+            }
+            if (crcPath != nullptr) {
+                auto hd = std::dynamic_pointer_cast<Fast::Texture>(
+                    Ship::Context::GetInstance()->GetResourceManager()->LoadResourceProcess(crcPath));
+                if (hd != nullptr && hd->Type == Fast::TextureType::RGBA32bpp && hd->ImageData != nullptr &&
+                    hd->Width > 0 && hd->Height > 0 && hd->Width <= 8192 && hd->Height <= 8192 &&
+                    uint64_t(hd->Width) * hd->Height * 4 <= hd->ImageDataSize) {
+                    mRapi->UploadTexture(hd->ImageData, hd->Width, hd->Height);
+                    return;
+                }
+            }
+        }
     }
 
     // [bg-tex] Race background layer cache miss: skybox (64x1 RGBA16), venue floor/clouds
